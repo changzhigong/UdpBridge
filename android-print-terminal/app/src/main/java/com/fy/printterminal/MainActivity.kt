@@ -256,6 +256,10 @@ class MainActivity : AppCompatActivity() {
             val p = printerList[position]
             val label = if (p.isDefault) "${p.name} (默认)" else p.name
             holder.tvName.text = label
+            // simple_list_item_single_choice 的选中态由内部 CheckedTextView 决定
+            if (holder.tvName is android.widget.CheckedTextView) {
+                (holder.tvName as android.widget.CheckedTextView).isChecked = (p.name == selectedPrinter)
+            }
             holder.itemView.isActivated = (p.name == selectedPrinter)
             holder.itemView.setOnClickListener {
                 selectPrinter(position)

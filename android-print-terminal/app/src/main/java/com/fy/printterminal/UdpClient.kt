@@ -8,7 +8,7 @@ import java.io.ByteArrayOutputStream
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
-import java.util.Base64
+import java.net.SocketTimeoutException
 
 /**
  * UDP 通信客户端 - 封装与 PC 端 UniversalPrintBridge 的通信
@@ -19,6 +19,7 @@ object UdpClient {
     private const val UDP_PORT = 52010
     private const val BROADCAST_TIMEOUT = 3000
     private const val MAX_BUFFER = 65507
+    private const val CHUNK_SIZE = 8000
 
     /**
      * 网关发现结果
@@ -77,12 +78,8 @@ object UdpClient {
     }
 
     /**
-     * 发送打印任务 (Base64 编码数据)
-     * @param gatewayIp 网关 IP
-     * @param type 打印类型 PDF/IMAGE/TEXT
-     * @param printer 打印机名称
-     * @param data 原始数据字节
-     * @param copies 份数
+     * 发送打印任务 (Base64 编码数据, 兼容旧接口)
+     * 内部统一走分片 UDP 传输(printRaw), 支持大文件
      */
     suspend fun printBase64(
         gatewayIp: String,
@@ -90,18 +87,92 @@ object UdpClient {
         printer: String,
         data: ByteArray,
         copies: Int = 1
+    ): PrintResult = printRaw(gatewayIp, type, printer, data, copies)
+
+    /**
+     * 发送打印任务 (分片 UDP 传输, 支持大文件)
+     * 协议:
+     *   1. 发送 PRINT 头(声明 chunks/size/type/printer)
+     *   2. 发送多个 CHUNK 包(JSON 头 + 8KB 原始数据)
+     *   3. 等待网关 READY / MISSING(重传) / QUEUED|DONE|FAIL
+     */
+    suspend fun printRaw(
+        gatewayIp: String,
+        type: String,
+        printer: String,
+        data: ByteArray,
+        copies: Int = 1
     ): PrintResult = withContext(Dispatchers.IO) {
-        val base64 = Base64.getEncoder().encodeToString(data)
-        val json = buildString {
-            append("{")
-            append("\"cmd\":\"PRINT\",")
-            append("\"type\":\"$type\",")
-            append("\"printer\":\"${escapeJson(printer)}\",")
-            append("\"copies\":$copies,")
-            append("\"data\":\"$base64\"")
-            append("}")
+        if (data.isEmpty()) return@withContext PrintResult("FAIL", "empty data")
+
+        val socket = DatagramSocket().apply { soTimeout = 2000 }
+        try {
+            val addr = InetAddress.getByName(gatewayIp)
+            val total = (data.size + CHUNK_SIZE - 1) / CHUNK_SIZE
+            val header = buildString {
+                append("{")
+                append("\"cmd\":\"PRINT\",")
+                append("\"prn\":\"${escapeJson(printer)}\",")
+                append("\"type\":\"$type\",")
+                append("\"copies\":$copies,")
+                append("\"chunks\":$total,")
+                append("\"size\":${data.size}")
+                append("}")
+            }
+            socket.send(DatagramPacket(header.toByteArray(Charsets.UTF_8), header.length, addr, UDP_PORT))
+
+            val buf = ByteArray(4096)
+            var result: PrintResult? = null
+            var retries = 0
+            sendAllChunks(socket, addr, data, total)
+            while (retries < 10) {
+                try {
+                    val packet = DatagramPacket(buf, buf.size)
+                    socket.receive(packet)
+                    val resp = String(packet.data, 0, packet.length, Charsets.UTF_8)
+                    when (val status = jsonGet(resp, "status")) {
+                        "READY" -> { sendAllChunks(socket, addr, data, total); retries++ }
+                        "MISSING" -> {
+                            val seqs = jsonGet(resp, "seqs")?.split(",")
+                                ?.mapNotNull { it.toIntOrNull() } ?: emptyList()
+                            sendChunks(socket, addr, data, seqs)
+                            retries++
+                        }
+                        "QUEUED", "DONE" -> { result = parsePrintResponse(resp); break }
+                        "FAIL" -> { result = parsePrintResponse(resp); break }
+                        else -> retries++
+                    }
+                } catch (e: SocketTimeoutException) {
+                    sendAllChunks(socket, addr, data, total)
+                    retries++
+                }
+            }
+            result ?: PrintResult("FAIL", "no response from gateway")
+        } finally {
+            socket.close()
         }
-        parsePrintResponse(sendUdp(gatewayIp, json))
+    }
+
+    private fun sendAllChunks(socket: DatagramSocket, addr: InetAddress, data: ByteArray, total: Int) {
+        for (seq in 0 until total) sendOneChunk(socket, addr, data, seq, total)
+    }
+
+    private fun sendChunks(socket: DatagramSocket, addr: InetAddress, data: ByteArray, seqs: List<Int>) {
+        val total = (data.size + CHUNK_SIZE - 1) / CHUNK_SIZE
+        for (seq in seqs) sendOneChunk(socket, addr, data, seq, total)
+    }
+
+    private fun sendOneChunk(socket: DatagramSocket, addr: InetAddress, data: ByteArray, seq: Int, total: Int) {
+        val start = seq * CHUNK_SIZE
+        if (start >= data.size) return
+        val end = minOf(start + CHUNK_SIZE, data.size)
+        val chunk = data.copyOfRange(start, end)
+        val json = """{"cmd":"CHUNK","seq":$seq,"total":$total}"""
+        val jsonBytes = json.toByteArray(Charsets.UTF_8)
+        val pkt = ByteArray(jsonBytes.size + chunk.size)
+        System.arraycopy(jsonBytes, 0, pkt, 0, jsonBytes.size)
+        System.arraycopy(chunk, 0, pkt, jsonBytes.size, chunk.size)
+        socket.send(DatagramPacket(pkt, pkt.size, addr, UDP_PORT))
     }
 
     /**

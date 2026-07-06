@@ -34,6 +34,7 @@ import javax.imageio.ImageIO;
 import javax.print.*;
 import javax.print.attribute.*;
 import javax.print.attribute.standard.*;
+import javax.swing.*;
 
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.printing.PDFPrintable;
@@ -42,6 +43,7 @@ import org.apache.pdfbox.printing.Orientation;
 public class UniversalPrintBridge {
     static final int UDP_PORT = 52010;
     static final int MAX_PACKET = 65507;
+    static final int CHUNK_SIZE = 8000;
     static final int MAX_RETRY = 3;
     static final String LOG_DIR = System.getenv("APPDATA") + "\\LodopUdpBridge";
     static PrintWriter log;
@@ -192,6 +194,81 @@ public class UniversalPrintBridge {
                 task.socket.send(pkt);
             } catch (Exception e) { /* best effort */ }
         }
+    }
+
+    // ==================== 分片组装(大文件打印) ====================
+    static final Map<String, Assembly> assemblies = new ConcurrentHashMap<>();
+    static final ScheduledExecutorService watchdog = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread t = new Thread(r, "ChunkWatchdog"); t.setDaemon(true); return t;
+    });
+
+    static class Assembly {
+        String printer;
+        int copies;
+        PrintType type;
+        int size;
+        int total;
+        byte[] buffer;
+        Set<Integer> received = new LinkedHashSet<>();
+        InetAddress addr;
+        int port;
+        DatagramSocket socket;
+        long start = System.currentTimeMillis();
+        int rounds = 0;
+        boolean done = false;
+    }
+
+    static String key(InetAddress a, int p) { return a.getHostAddress() + ":" + p; }
+
+    static void startWatchdog() {
+        watchdog.scheduleAtFixedRate(() -> {
+            long now = System.currentTimeMillis();
+            for (Map.Entry<String, Assembly> e : assemblies.entrySet()) {
+                Assembly a = e.getValue();
+                if (a.done) continue;
+                if (now - a.start < 2000) continue;
+                synchronized (a) {
+                    if (a.received.size() >= a.total) { finalizeAssembly(a); continue; }
+                    java.util.List<Integer> missing = new ArrayList<>();
+                    for (int i = 0; i < a.total; i++) if (!a.received.contains(i)) missing.add(i);
+                    a.rounds++;
+                    if (a.rounds > 3) {
+                        try { sendJson(a.socket, a.addr, a.port, "{\"status\":\"FAIL\",\"msg\":\"chunk timeout\"}"); } catch (Exception ex) {}
+                        assemblies.remove(e.getKey());
+                        logErr("分片接收超时 prn=" + a.printer + " 缺失=" + missing.size());
+                        continue;
+                    }
+                    StringBuilder sb = new StringBuilder();
+                    for (int i = 0; i < missing.size(); i++) { if (i > 0) sb.append(","); sb.append(missing.get(i)); }
+                    try { sendJson(a.socket, a.addr, a.port, "{\"cmd\":\"MISSING\",\"seqs\":\"" + sb + "\"}"); } catch (Exception ex) {}
+                    a.start = now;
+                }
+            }
+        }, 500, 500, TimeUnit.MILLISECONDS);
+    }
+
+    static void finalizeAssembly(Assembly a) {
+        synchronized (a) {
+            if (a.done) return;
+            a.done = true;
+        }
+        byte[] payload = a.buffer;
+        PrintType type = a.type != null ? a.type : detectType(payload);
+        log("分片组装完成 prn=" + a.printer + " type=" + type + " size=" + payload.length);
+        queuePrint(a.printer, payload, type, a.copies, a.socket, a.addr, a.port);
+        assemblies.remove(key(a.addr, a.port));
+    }
+
+    static void queuePrint(String prn, byte[] payload, PrintType type, int copies,
+                           DatagramSocket socket, InetAddress addr, int port) {
+        log("PRINT prn=" + prn + " type=" + type + " size=" + payload.length + " copies=" + copies);
+        PrintTask task = new PrintTask(prn, payload, type, copies);
+        task.socket = socket; task.addr = addr; task.port = port;
+        PrintQueue.INSTANCE.submit(task);
+        try {
+            sendJson(socket, addr, port,
+                "{\"status\":\"QUEUED\",\"prn\":\"" + escapeJson(prn) + "\",\"type\":\"" + type + "\"}");
+        } catch (Exception e) { /* best effort */ }
     }
 
     // ==================== 工具方法 ====================
@@ -355,8 +432,17 @@ public class UniversalPrintBridge {
 
             MenuItem printersItem = new MenuItem("查看打印机");
             printersItem.addActionListener(e -> {
-                String list = listPrinters();
-                log("打印机列表: " + list);
+                try {
+                    PrintService[] all = PrintServiceLookup.lookupPrintServices(null, null);
+                    StringBuilder sb = new StringBuilder();
+                    sb.append("已检测到 ").append(all.length).append(" 台打印机:\n\n");
+                    for (PrintService ps : all) sb.append("• ").append(ps.getName()).append("\n");
+                    JOptionPane.showMessageDialog(null, sb.toString(),
+                        "打印机列表", JOptionPane.INFORMATION_MESSAGE);
+                    log("查看打印机: 共 " + all.length + " 台");
+                } catch (Exception ex) {
+                    logErr("无法显示打印机列表窗口: " + ex.getMessage());
+                }
             });
             menu.add(printersItem);
 
@@ -400,6 +486,9 @@ public class UniversalPrintBridge {
             // 系统托盘
             setupTray();
 
+            // 分片接收看门狗(超时缺失重传)
+            startWatchdog();
+
             // UDP 服务
             DatagramSocket socket = new DatagramSocket(UDP_PORT);
             log("UDP 监听端口 " + UDP_PORT);
@@ -438,9 +527,10 @@ public class UniversalPrintBridge {
                     log("LIST -> " + addr.getHostAddress() + ":" + rport);
 
                 } else if ("PRINT".equals(cmd)) {
-                    // 打印任务 - 支持两种协议:
-                    // 方式A: JSON + 原始二进制数据(JSON 头后面直接跟数据)
-                    // 方式B: JSON 内嵌 Base64(type + data 字段)
+                    // 打印任务 - 三种协议:
+                    //   方式B: JSON 内嵌 Base64(type+data) —— 小数据兼容
+                    //   分片模式: JSON 声明 chunks/size —— Android 主用(支持大文件)
+                    //   方式A: JSON + 原始二进制(单包) —— 旧兼容(仅小文件)
                     String prn = jsonGet(cmdJson, "prn");
                     if (prn == null || prn.isEmpty()) prn = jsonGet(cmdJson, "printer");
                     if (prn == null || prn.isEmpty()) {
@@ -450,47 +540,78 @@ public class UniversalPrintBridge {
                     String copiesStr = jsonGet(cmdJson, "copies");
                     int copies = (copiesStr != null) ? Integer.parseInt(copiesStr) : 1;
 
-                    byte[] payload = null;
-                    PrintType type = null;
-
-                    // 方式B: Base64 协议
+                    // 方式B: Base64 内嵌数据
                     String typeStr = jsonGet(cmdJson, "type");
                     String base64 = jsonGetLongField(cmdJson, "data");
                     if (typeStr != null && base64 != null && !base64.isEmpty()) {
+                        byte[] payload;
                         try {
                             payload = Base64.getDecoder().decode(base64);
                         } catch (Exception e) {
-                            logErr("Base64 解码失败: " + e.getMessage());
                             sendJson(socket, addr, rport, "{\"status\":\"FAIL\",\"msg\":\"base64 decode error\"}");
                             continue;
                         }
-                        if ("PDF".equalsIgnoreCase(typeStr)) type = PrintType.PDF;
-                        else if ("IMAGE".equalsIgnoreCase(typeStr)) type = PrintType.IMAGE;
-                        else type = PrintType.TEXT;
-                    }
-
-                    // 方式A: 原始二进制数据协议
-                    if (payload == null && parsed.length > 1 && !parsed[1].isEmpty()) {
-                        int jsonEnd = Integer.parseInt(parsed[1]);
-                        if (jsonEnd < len) {
-                            payload = new byte[len - jsonEnd];
-                            System.arraycopy(buf, jsonEnd, payload, 0, payload.length);
-                            type = detectType(payload);
-                        }
-                    }
-
-                    if (payload == null || payload.length == 0) {
-                        sendJson(socket, addr, rport, "{\"status\":\"FAIL\",\"msg\":\"no data\"}");
+                        PrintType t = "PDF".equalsIgnoreCase(typeStr) ? PrintType.PDF
+                                : "IMAGE".equalsIgnoreCase(typeStr) ? PrintType.IMAGE : PrintType.TEXT;
+                        queuePrint(prn, payload, t, copies, socket, addr, rport);
                         continue;
                     }
-                    if (type == null) type = detectType(payload);
 
-                    log("PRINT prn=" + prn + " type=" + type + " size=" + payload.length + " copies=" + copies);
+                    // 分片模式(Android 主用)
+                    String chunksStr = jsonGet(cmdJson, "chunks");
+                    String sizeStr = jsonGet(cmdJson, "size");
+                    if (chunksStr != null && sizeStr != null) {
+                        int total = Integer.parseInt(chunksStr);
+                        int size = Integer.parseInt(sizeStr);
+                        PrintType t = null;
+                        if (typeStr != null) {
+                            t = "PDF".equalsIgnoreCase(typeStr) ? PrintType.PDF
+                                : "IMAGE".equalsIgnoreCase(typeStr) ? PrintType.IMAGE : PrintType.TEXT;
+                        }
+                        Assembly a = new Assembly();
+                        a.printer = prn; a.copies = copies; a.type = t;
+                        a.size = size; a.total = total;
+                        a.buffer = new byte[size];
+                        a.addr = addr; a.port = rport; a.socket = socket;
+                        a.start = System.currentTimeMillis();
+                        assemblies.put(key(addr, rport), a);
+                        sendJson(socket, addr, rport, "{\"status\":\"READY\",\"chunks\":" + total + "}");
+                        log("PRINT 分片模式 prn=" + prn + " chunks=" + total + " size=" + size);
+                        continue;
+                    }
 
-                    PrintTask task = new PrintTask(prn, payload, type, copies);
-                    task.socket = socket; task.addr = addr; task.port = rport;
-                    PrintQueue.INSTANCE.submit(task);
-                    sendJson(socket, addr, rport, "{\"status\":\"QUEUED\",\"prn\":\"" + escapeJson(prn) + "\",\"type\":\"" + type + "\"}");
+                    // 方式A: 单包原始二进制(仅小文件)
+                    if (parsed.length > 1 && !parsed[1].isEmpty()) {
+                        int jsonEnd = Integer.parseInt(parsed[1]);
+                        if (jsonEnd < len) {
+                            byte[] payload = new byte[len - jsonEnd];
+                            System.arraycopy(buf, jsonEnd, payload, 0, payload.length);
+                            queuePrint(prn, payload, detectType(payload), copies, socket, addr, rport);
+                            continue;
+                        }
+                    }
+                    sendJson(socket, addr, rport, "{\"status\":\"FAIL\",\"msg\":\"no data\"}");
+
+                } else if ("CHUNK".equals(cmd)) {
+                    String seqStr = jsonGet(cmdJson, "seq");
+                    if (seqStr == null) continue;
+                    int seq = Integer.parseInt(seqStr);
+                    Assembly a = assemblies.get(key(addr, rport));
+                    if (a == null) { log("忽略孤立分片 seq=" + seq); continue; }
+                    if (parsed.length > 1 && !parsed[1].isEmpty()) {
+                        int jsonEnd = Integer.parseInt(parsed[1]);
+                        int chunkLen = len - jsonEnd;
+                        if (chunkLen > 0) {
+                            synchronized (a) {
+                                int offset = seq * CHUNK_SIZE;
+                                if (offset + chunkLen <= a.buffer.length) {
+                                    System.arraycopy(buf, jsonEnd, a.buffer, offset, chunkLen);
+                                    a.received.add(seq);
+                                }
+                            }
+                            if (a.received.size() >= a.total) finalizeAssembly(a);
+                        }
+                    }
 
                 } else {
                     sendJson(socket, addr, rport, "{\"status\":\"FAIL\",\"msg\":\"unknown cmd: " + escapeJson(String.valueOf(cmd)) + "\"}");
