@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  LodopUdpBridge-minimal.wxs - Minimal WiX 3 installer (no UI, no ICE issues)
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product
+    Id="*"
+    Name="LodopUdpBridge"
+    Language="1033"
+    Version="1.0.0"
+    Manufacturer="FY App"
+    UpgradeCode="8A9B8C7D-6E5F-4A3B-2C1D-0E1F2A3B4C5D">
+
+    <Package
+      Id="*"
+      InstallerVersion="300"
+      Compressed="yes"
+      InstallScope="perMachine"
+      Platform="x64" />
+
+    <Media Id="1" Cabinet="LodopUdpBridge.cab" EmbedCab="yes" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder" Name="PFiles">
+        <Directory Id="INSTALLDIR" Name="LodopUdpBridge">
+          <Component Id="MainFiles" Guid="A1B2C3D4-E5F6-7890-1234-567890ABCDEF">
+            <File Id="LodopUdpBridgeJar" Name="LodopUdpBridge.jar" Source="LodopUdpBridge.jar" KeyPath="yes" />
+            <File Id="RunBat" Name="run.bat" Source="run.bat" />
+          </Component>
+        </Directory>
+      </Directory>
+    </Directory>
+
+    <Feature Id="Complete" Title="LodopUdpBridge" Level="1">
+      <ComponentRef Id="MainFiles" />
+    </Feature>
+
+  </Product>
+</Wix>

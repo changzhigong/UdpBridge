@@ -1,0 +1,26 @@
+# === Java 编译产物 ===
+*.class
+*.jar
+
+# === WiX 中间产物 ===
+*.wixobj
+*.wixpdb
+
+# === JRE 运行时（CI 构建时用 jlink 生成，不入库）===
+installer/jre/
+dist-bridge/runtime/
+
+# === 安装包输出 ===
+installer-output/
+dist-bridge/LodopUdpBridge_Setup.exe
+dist-bridge/innosetup.exe
+
+# === 例外：保留 C 启动器二进制（CI 不编译 C，直接复用）===
+!installer/launch.exe
+
+# === 日志/临时 ===
+*.log
+*.tmp
+
+# === WorkBuddy 工作空间元数据 ===
+.workbuddy/

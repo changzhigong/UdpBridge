@@ -1,0 +1,92 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      skip_release:
+        description: '跳过创建 Release（仅构建 artifact）'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Compile Java and build JAR
+        shell: cmd
+        run: |
+          cd installer
+          javac --release 17 -encoding UTF-8 -d . ..\LodopUdpBridge.java
+          jar cfe LodopUdpBridge.jar LodopUdpBridge LodopUdpBridge.class LodopUdpBridge$1.class LodopUdpBridge$2.class LodopUdpBridge$3.class
+          dir LodopUdpBridge.jar
+
+      - name: Generate JRE with jlink
+        shell: cmd
+        run: |
+          cd installer
+          jlink --add-modules java.base,java.datatransfer,java.xml,java.prefs,java.desktop,java.logging,java.net.http --output jre --strip-debug --no-header-files --no-man-pages --compress=2
+          dir jre\bin\javaw.exe
+
+      - name: Compile Inno Setup installer
+        shell: powershell
+        run: |
+          Set-Location installer
+          $iscc = @(
+            "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+            "C:\Program Files\Inno Setup 6\ISCC.exe"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) {
+            Write-Host "Inno Setup not found, installing via choco..."
+            choco install innosetup -y --no-progress
+            $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          }
+          Write-Host "Using ISCC: $iscc"
+          & $iscc "LodopUdpBridge.iss"
+          if ($LASTEXITCODE -ne 0) { throw "ISCC compile failed with exit code $LASTEXITCODE" }
+
+      - name: Verify artifact
+        shell: powershell
+        run: |
+          $exe = "installer\installer-output\LodopUdpBridge_Setup.exe"
+          if (Test-Path $exe) {
+            $size = (Get-Item $exe).Length
+            Write-Host "Setup.exe size: $([math]::Round($size/1MB, 2)) MB"
+          } else {
+            throw "Setup.exe not found at $exe"
+          }
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LodopUdpBridge_Setup
+          path: installer/installer-output/LodopUdpBridge_Setup.exe
+          retention-days: 30
+
+      - name: Create GitHub Release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          echo "Creating release for tag: $TAG"
+          gh release create "$TAG" \
+            installer/installer-output/LodopUdpBridge_Setup.exe \
+            --generate-notes \
+            --title "LodopUdpBridge $TAG"

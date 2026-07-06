@@ -1,0 +1,698 @@
+import java.net.*;
+import java.io.*;
+import java.nio.charset.StandardCharsets;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.regex.*;
+import javax.swing.*;
+import java.awt.*;
+import java.awt.event.*;
+import java.awt.image.BufferedImage;
+import javax.print.*;
+
+/**
+ * LodopUdpBridge —— 局域网打印网关（纯后台版）
+ *
+ * 架构：
+ *   App → UDP(DISCOVER/PRINT) → Java Bridge → WebSocket(CLODOP协议) → C-Lodop → 针式打印机
+ *
+ * 无浏览器、无HTTP服务器、无桥页面
+ * Java 进程后台运行 + 系统托盘图标
+ *
+ * 修正点（对齐 CLodopfuncs.js 和 picking_shipping.py）：
+ *   1. tid 格式：JAVA_HHMMSS_N（对齐 CLodop GetTaskID）
+ *   2. pagename 字段：调拨=A4、拣货=""
+ *   3. 逐条发送：每条 HTML 单独一个 WS 消息
+ *   4. 打印机枚举：从 CLodop WS 获取 Printers 对象，fallback 到 javax.print
+ *   5. 测试页：用 CLodop WS 协议格式（非 Lodop JS 脚本）
+ *   6. CLodop 推送 JS 库：接收但不 eval，提取 Printers 对象
+ *   7. CLodop 响应处理：解析 TaskID=true/false，返回 PRINT_ACK 闭环
+ *
+ * @author FY App
+ * @date 2026-06-24
+ */
+public class LodopUdpBridge {
+
+    static final int UDP_PORT = 51010;
+    static final String CLODOP_WS_URL = "ws://127.0.0.1:8000/c_webskt/";
+
+    // CLodop 协议分隔符 — 与 CLodopfuncs.js 第 9 行 DelimChar 一致
+    static final String DELIM = "\f\f";
+
+    // 递增 tid 序号（对齐 CLodop GetTaskID 格式）
+    static int iBaseTask = 0;
+
+    // 托盘图标
+    static TrayIcon trayIcon;
+    static List<String> printerList = new ArrayList<>();
+    static boolean clodopConnected = false;
+
+    // ============ Task ID 生成（修正 #1）============
+
+    static String generateTaskId() {
+        LocalDateTime now = LocalDateTime.now();
+        iBaseTask++;
+        return String.format("JAVA%02d%02d%02d_%d",
+            now.getHour(), now.getMinute(), now.getSecond(), iBaseTask);
+    }
+
+    // ============ CLodop WS 协议消息构建（修正 #2,#3）============
+
+    /**
+     * 构建单条打印任务的 CLodop WS 协议消息
+     * 对齐 picking_shipping.py 第 3641-3672 行的精确字段顺序
+     */
+    static String buildClodopMessage(String taskId, String taskName, String printerName,
+                                      String orient, String pageWidth, String pageHeight,
+                                      String pageName, String htmlContent) {
+        return String.join(DELIM,
+            "post:charset=丂",
+            "tid=" + taskId,
+            "act=print",
+            "browseurl=JAVA_CLODOP",
+            "companyname=用友汽车信息科技（上海）股份有限公司",
+            "license=FA9A697F2551BCE81BD852A4EB520525347",
+            "licensea=用友汽車信息科技（上海）股份有限公司",
+            "licenseb=C66313BD8413BD0174C2CADD29F5380CD92",
+            "licensec=Yonyou Auto Information Technology (Shanghai) Co., Ltd.",
+            "licensed=941DF3639D9F5679867946141A31424B4E6",
+            "top=",
+            "left=",
+            "width=",
+            "height=",
+            "printtask=" + taskName,
+            "printerindex=" + printerName,
+            "orient=" + orient,
+            "pagewidth=" + pageWidth,
+            "pageheight=" + pageHeight,
+            "pagename=" + pageName,
+            "printcopies=1",
+            "itemcount=1",
+            "1_type=4",
+            "1_top=30",
+            "1_left=3mm",
+            "1_width=100%",
+            "1_height=100%",
+            "1_content=" + htmlContent,
+            "1_itemstylenames=",
+            "printmodenames=;left;top;width;height",
+            "printstyleclassnames="
+        );
+    }
+
+    // ============ 打印机枚举（修正 #4）============
+
+    /**
+     * 从 CLodop WS 获取打印机列表（推荐方式）
+     * CLodop 连接后推送 JS 库代码，其中包含 Printers 对象
+     */
+    static List<String> listPrintersFromClodop() {
+        List<String> printers = new ArrayList<>();
+        try {
+            String clodopJs = fetchClodopInitMessage();
+            if (clodopJs == null || clodopJs.isEmpty()) {
+                return listPrintersFallback();
+            }
+
+            // 解析 Printers JSON
+            // 格式：Printers={"default":"5","list":[{"name":"EPSON LQ-630K ESC/P2",...}]}
+            Pattern p = Pattern.compile("Printers[\\s]*=[\\s]*\\{.*?\"list\"[\\s]*:[\\s]*\\[(.*?)\\]", Pattern.DOTALL);
+            Matcher m = p.matcher(clodopJs);
+            if (m.find()) {
+                String listJson = "[" + m.group(1) + "]";
+                Pattern nameP = Pattern.compile("\"name\"[\\s]*:[\\s]*\"([^\"]+)\"");
+                Matcher nameM = nameP.matcher(listJson);
+                while (nameM.find()) {
+                    String name = nameM.group(1);
+                    printers.add(name);
+                }
+            }
+        } catch (Exception e) {
+            System.err.println("从 CLodop 获取打印机列表失败: " + e.getMessage());
+            return listPrintersFallback();
+        }
+        if (printers.isEmpty()) {
+            return listPrintersFallback();
+        }
+        return printers;
+    }
+
+    /** 从 CLodop WS 获取初始化消息（含 Printers 对象） */
+    static String fetchClodopInitMessage() {
+        StringBuilder initMsg = new StringBuilder();
+        CountDownLatch msgLatch = new CountDownLatch(1);
+
+        try {
+            // 使用简单的 WebSocket 客户端连接 CLodop
+            // CLodop 在连接后会推送 JS 库代码（含 Printers 对象）
+            java.net.http.HttpClient client = java.net.http.HttpClient.newHttpClient();
+            java.net.http.WebSocket.Listener listener = new java.net.http.WebSocket.Listener() {
+                StringBuilder buffer = new StringBuilder();
+                @Override
+                public void onOpen(java.net.http.WebSocket ws) {
+                    ws.request(1);
+                }
+                @Override
+                public void onText(java.net.http.WebSocket ws, CharSequence data, boolean last) {
+                    buffer.append(data);
+                    if (last) {
+                        initMsg.append(buffer.toString());
+                        msgLatch.countDown();
+                        ws.request(1);
+                    }
+                }
+                @Override
+                public void onClose(java.net.http.WebSocket ws, int code, String reason) {
+                    msgLatch.countDown();
+                }
+                @Override
+                public void onError(java.net.http.WebSocket ws, Throwable err) {
+                    msgLatch.countDown();
+                }
+            };
+
+            java.net.http.WebSocket ws = client.newWebSocketBuilder()
+                .buildAsync(URI.create(CLODOP_WS_URL), listener)
+                .get(5, TimeUnit.SECONDS);
+
+            // 等待 CLodop 推送初始化消息
+            boolean received = msgLatch.await(5, TimeUnit.SECONDS);
+            ws.sendClose(java.net.http.WebSocket.NORMAL_CLOSURE, "done");
+            return received ? initMsg.toString() : null;
+        } catch (Exception e) {
+            System.err.println("连接 CLodop WS 获取打印机列表失败: " + e.getMessage());
+            return null;
+        }
+    }
+
+    /** Fallback：CLodop 未启动时使用 javax.print */
+    static List<String> listPrintersFallback() {
+        List<String> printers = new ArrayList<>();
+        for (PrintService ps : PrintServiceLookup.lookupPrintServices(null, null)) {
+            printers.add(ps.getName());
+        }
+        return printers;
+    }
+
+    // ============ CLodop WS 客户端与响应处理（修正 #6,#7）============
+
+    /**
+     * 发送单条打印命令到 CLodop 并等待响应
+     * 解析 TaskID=ResultValue 响应，true=成功/false=失败
+     */
+    static boolean sendToClodopAndWait(String message, int timeoutMs) {
+        CountDownLatch resultLatch = new CountDownLatch(1);
+        final String[] resultValue = {""};
+
+        try {
+            java.net.http.HttpClient client = java.net.http.HttpClient.newHttpClient();
+            java.net.http.WebSocket.Listener listener = new java.net.http.WebSocket.Listener() {
+                StringBuilder buffer = new StringBuilder();
+                boolean initReceived = false;
+
+                @Override
+                public void onOpen(java.net.http.WebSocket ws) {
+                    ws.request(1);
+                }
+
+                @Override
+                public void onText(java.net.http.WebSocket ws, CharSequence data, boolean last) {
+                    String msg = data.toString();
+                    buffer.append(msg);
+
+                    if (last) {
+                        String fullMsg = buffer.toString();
+                        buffer.setLength(0);
+
+                        // 修正 #6：CLodop 连接后先推送 JS 库代码，接收但不 eval
+                        if (!initReceived && (fullMsg.contains("strWebPageID") || fullMsg.contains("Printers"))) {
+                            initReceived = true;
+                            // 提取打印机列表
+                            Pattern nameP = Pattern.compile("\"name\"[\\s]*:[\\s]*\"([^\"]+)\"");
+                            Matcher nameM = nameP.matcher(fullMsg);
+                            synchronized (printerList) {
+                                printerList.clear();
+                                while (nameM.find()) {
+                                    printerList.add(nameM.group(1));
+                                }
+                            }
+                        }
+
+                        // 修正 #7：解析 CLodop 响应 TaskID=ResultValue
+                        if (fullMsg.contains("=") && !fullMsg.contains("strWebPageID") && !fullMsg.contains("Printers")) {
+                            int pos = fullMsg.indexOf("=");
+                            if (pos > 0 && pos < 50) {
+                                resultValue[0] = fullMsg.substring(pos + 1).trim().toLowerCase();
+                                resultLatch.countDown();
+                            }
+                        }
+
+                        // CLodop 返回错误消息
+                        if (fullMsg.contains("ErrorMS")) {
+                            resultValue[0] = "error";
+                            resultLatch.countDown();
+                        }
+                    }
+                    ws.request(1);
+                }
+
+                @Override
+                public void onClose(java.net.http.WebSocket ws, int code, String reason) {
+                    resultLatch.countDown();
+                }
+
+                @Override
+                public void onError(java.net.http.WebSocket ws, Throwable err) {
+                    resultValue[0] = "error";
+                    resultLatch.countDown();
+                }
+            };
+
+            java.net.http.WebSocket ws = client.newWebSocketBuilder()
+                .buildAsync(URI.create(CLODOP_WS_URL), listener)
+                .get(5, TimeUnit.SECONDS);
+
+            // 等待连接就绪后发送协议消息
+            Thread.sleep(500);
+            ws.sendText(message, true);
+
+            // 等待 CLodop 响应
+            boolean received = resultLatch.await(timeoutMs, TimeUnit.MILLISECONDS);
+            ws.sendClose(java.net.http.WebSocket.NORMAL_CLOSURE, "done");
+
+            if (!received) return false;
+            return resultValue[0].equals("true");
+
+        } catch (Exception e) {
+            System.err.println("CLodop WS 打印失败: " + e.getMessage());
+            return false;
+        }
+    }
+
+    // ============ UDP 消息处理 ============
+
+    static void handleUdpMessage(DatagramSocket socket, DatagramPacket packet, String message) {
+        String senderIp = packet.getAddress().getHostAddress();
+        int senderPort = packet.getPort();
+
+        try {
+            // 解析 JSON 消息（简单解析，避免依赖 JSON 库）
+            String cmd = extractJsonField(message, "cmd");
+
+            if ("DISCOVER".equals(cmd)) {
+                // ---- DISCOVER 响应 ----
+                // 返回 IP + 打印机列表（从 CLodop 获取）
+                List<String> printers;
+                synchronized (printerList) {
+                    printers = new ArrayList<>(printerList);
+                }
+                if (printers.isEmpty()) {
+                    printers = listPrintersFromClodop();
+                    synchronized (printerList) {
+                        printerList.clear();
+                        printerList.addAll(printers);
+                    }
+                }
+
+                String hostname = InetAddress.getLocalHost().getHostName();
+                String localIp = getLocalIp();
+
+                // 构建响应 JSON
+                StringBuilder sb = new StringBuilder();
+                sb.append("{\"cmd\":\"DISCOVER_ACK\",\"hostname\":\"").append(escapeJsonStr(hostname));
+                sb.append("\",\"ip\":\"").append(escapeJsonStr(localIp));
+                sb.append("\",\"printers\":");
+                sb.append("[");
+                for (int i = 0; i < printers.size(); i++) {
+                    if (i > 0) sb.append(",");
+                    sb.append("\"").append(escapeJsonStr(printers.get(i))).append("\"");
+                }
+                sb.append("]}");
+
+                byte[] respData = sb.toString().getBytes(StandardCharsets.UTF_8);
+                DatagramPacket respPacket = new DatagramPacket(respData, respData.length,
+                    packet.getAddress(), senderPort);
+                socket.send(respPacket);
+
+                System.out.println("[DISCOVER] 响应 → " + senderIp + " (打印机: " + printers.size() + " 台)");
+                showNotification("发现请求", senderIp + " 请求打印服务");
+
+            } else if ("PRINT".equals(cmd)) {
+                // ---- PRINT 请求 ----
+                // 逐条发送到 CLodop（修正 #3）
+                String printer = extractJsonField(message, "printer");
+                String orient = extractJsonField(message, "orient");
+                String pageWidth = extractJsonField(message, "pageWidth");
+                String pageHeight = extractJsonField(message, "pageHeight");
+                String pageName = extractJsonField(message, "pageName");
+                String taskName = extractJsonField(message, "taskName");
+                String html = extractJsonField(message, "html");
+
+                if (html == null || html.isEmpty()) {
+                    sendPrintAck(socket, packet.getAddress(), senderPort, false, "HTML 内容为空");
+                    return;
+                }
+
+                // 如果打印机列表为空，尝试从 CLodop 获取
+                if (printerList.isEmpty()) {
+                    List<String> fresh = listPrintersFromClodop();
+                    synchronized (printerList) {
+                        printerList.clear();
+                        printerList.addAll(fresh);
+                    }
+                }
+
+                // 构建并发送 CLodop 协议消息
+                String taskId = generateTaskId();
+                String clodopMsg = buildClodopMessage(taskId, taskName, printer,
+                    orient, pageWidth, pageHeight, pageName, html);
+
+                boolean ok = sendToClodopAndWait(clodopMsg, 15000);
+
+                // 返回 PRINT_ACK（修正 #7）
+                if (ok) {
+                    sendPrintAck(socket, packet.getAddress(), senderPort, true, taskId + "=true");
+                    System.out.println("[PRINT] 成功 → " + senderIp + " (" + taskName + ")");
+                    showNotification("打印成功", taskName + " - " + printer);
+                } else {
+                    sendPrintAck(socket, packet.getAddress(), senderPort, false, "CLodop 返回 false");
+                    System.out.println("[PRINT] 失败 → " + senderIp + " (" + taskName + ")");
+                    showNotification("打印失败", taskName + " - CLodop 返回 false");
+                }
+
+            } else {
+                System.out.println("[UDP] 未知命令: " + cmd + " (来自 " + senderIp + ")");
+            }
+
+        } catch (Exception e) {
+            System.err.println("处理 UDP 消息失败: " + e.getMessage());
+            try {
+                sendPrintAck(socket, packet.getAddress(), senderPort, false, "Bridge 内部错误: " + e.getMessage());
+            } catch (Exception ignored) {}
+        }
+    }
+
+    /** 发送 PRINT_ACK 响应到 App */
+    static void sendPrintAck(DatagramSocket socket, InetAddress addr, int port, boolean ok, String detail) {
+        try {
+            String ack = "{\"cmd\":\"PRINT_ACK\",\"ok\":" + ok + ",\"detail\":\"" + escapeJsonStr(detail) + "\"}";
+            byte[] data = ack.getBytes(StandardCharsets.UTF_8);
+            DatagramPacket resp = new DatagramPacket(data, data.length, addr, port);
+            socket.send(resp);
+        } catch (Exception e) {
+            System.err.println("发送 PRINT_ACK 失败: " + e.getMessage());
+        }
+    }
+
+    // ============ JSON 解析辅助 ============
+
+    /** 从 JSON 字符串中提取指定字段的值（简单解析） */
+    static String extractJsonField(String json, String field) {
+        // 支持 "field":"value" 和 "field": value 格式
+        Pattern p = Pattern.compile("\"" + field + "\"[\\s]*:[\\s]*\"([^\"]*?)\"");
+        Matcher m = p.matcher(json);
+        if (m.find()) return m.group(1);
+
+        // 尝试无引号格式（如 "ok":true）
+        p = Pattern.compile("\"" + field + "\"[\\s]*:[\\s]*(\\w+)");
+        m = p.matcher(json);
+        if (m.find()) return m.group(1);
+
+        return null;
+    }
+
+    static String escapeJsonStr(String s) {
+        if (s == null) return "";
+        return s.replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("\n", "\\n")
+                .replace("\r", "\\r")
+                .replace("\t", "\\t");
+    }
+
+    // ============ 获取本机局域网 IP ============
+
+    static String getLocalIp() {
+        try {
+            // 优先获取局域网 IP（非 127.0.0.1）
+            Enumeration<NetworkInterface> nets = NetworkInterface.getNetworkInterfaces();
+            while (nets.hasMoreElements()) {
+                NetworkInterface net = nets.nextElement();
+                if (net.isLoopback() || !net.isUp()) continue;
+                Enumeration<InetAddress> addrs = net.getInetAddresses();
+                while (addrs.hasMoreElements()) {
+                    InetAddress addr = addrs.nextElement();
+                    if (addr.isLoopbackAddress()) continue;
+                    if (addr instanceof Inet4Address) {
+                        String ip = addr.getHostAddress();
+                        if (ip.startsWith("192.168.") || ip.startsWith("10.") || ip.startsWith("172.")) {
+                            return ip;
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {}
+        try {
+            return InetAddress.getLocalHost().getHostAddress();
+        } catch (Exception e) {
+            return "127.0.0.1";
+        }
+    }
+
+    // ============ 系统托盘 ============
+
+    static void initTray() {
+        try {
+            SystemTray tray = SystemTray.getSystemTray();
+            Image icon = createTrayIcon();
+            trayIcon = new TrayIcon(icon, "LodopUdpBridge");
+            trayIcon.setImageAutoSize(true);
+
+            PopupMenu popup = new PopupMenu();
+
+            // 状态
+            MenuItem statusItem = new MenuItem("状态: 运行中（端口 " + UDP_PORT + "）");
+            statusItem.setEnabled(false);
+            popup.add(statusItem);
+            popup.addSeparator();
+
+            // 查看打印机列表
+            MenuItem printersItem = new MenuItem("查看打印机列表");
+            printersItem.addActionListener(e -> {
+                List<String> printers;
+                synchronized (printerList) {
+                    printers = new ArrayList<>(printerList);
+                }
+                String msg = printers.isEmpty() ? "无打印机（请确认 CLodop 已启动）" :
+                    "打印机列表（共 " + printers.size() + " 台）：\n" +
+                    String.join("\n", printers);
+                JOptionPane.showMessageDialog(null, msg, "打印机列表", JOptionPane.INFORMATION_MESSAGE);
+            });
+            popup.add(printersItem);
+
+            // 打印测试页（修正 #5：用 CLodop WS 协议格式）
+            MenuItem testItem = new MenuItem("打印测试页");
+            testItem.addActionListener(e -> sendTestPage());
+            popup.add(testItem);
+
+            // 重新连接 CLodop
+            MenuItem reconnectItem = new MenuItem("重新连接 CLodop");
+            reconnectItem.addActionListener(e -> {
+                List<String> fresh = listPrintersFromClodop();
+                synchronized (printerList) {
+                    printerList.clear();
+                    printerList.addAll(fresh);
+                }
+                clodopConnected = !fresh.isEmpty();
+                updateTrayTooltip();
+                showNotification("重新连接",
+                    clodopConnected ? "CLodop 已连接（" + fresh.size() + " 台打印机）" : "CLodop 未启动");
+            });
+            popup.add(reconnectItem);
+
+            popup.addSeparator();
+
+            // 退出
+            MenuItem exitItem = new MenuItem("退出");
+            exitItem.addActionListener(e -> {
+                tray.remove(trayIcon);
+                System.exit(0);
+            });
+            popup.add(exitItem);
+
+            trayIcon.setPopupMenu(popup);
+            tray.add(trayIcon);
+            System.out.println("✓ 系统托盘已创建");
+        } catch (Exception e) {
+            System.err.println("托盘初始化失败: " + e.getMessage());
+        }
+    }
+
+    static Image createTrayIcon() {
+        return new BufferedImage(16, 16, BufferedImage.TYPE_INT_ARGB) {
+            {
+                Graphics2D g = createGraphics();
+                g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                g.setColor(clodopConnected ? new Color(76, 175, 80) : new Color(244, 67, 54));
+                g.fillOval(1, 1, 14, 14);
+                g.setColor(Color.WHITE);
+                g.setFont(new Font("Arial", Font.BOLD, 10));
+                g.drawString("P", 4, 13);
+                g.dispose();
+            }
+        };
+    }
+
+    static void updateTrayTooltip() {
+        if (trayIcon != null) {
+            trayIcon.setToolTip("LodopUdpBridge —— " +
+                (clodopConnected ? "CLodop 已连接" : "CLodop 未连接"));
+        }
+    }
+
+    static void showNotification(String title, String message) {
+        if (trayIcon != null) {
+            trayIcon.displayMessage(title, message, TrayIcon.MessageType.INFO);
+        }
+    }
+
+    // ============ 测试页（修正 #5：用 CLodop WS 协议格式）============
+
+    static void sendTestPage() {
+        List<String> printers;
+        synchronized (printerList) {
+            printers = new ArrayList<>(printerList);
+        }
+        if (printers.isEmpty()) {
+            printers = listPrintersFromClodop();
+            synchronized (printerList) {
+                printerList.clear();
+                printerList.addAll(printers);
+            }
+        }
+
+        if (printers.isEmpty()) {
+            JOptionPane.showMessageDialog(null,
+                "未发现打印机！请确认 CLodop 已启动且打印机已安装。",
+                "打印测试页", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+
+        // 选择打印机
+        String selected = (String) JOptionPane.showInputDialog(null,
+            "选择打印机：", "打印测试页",
+            JOptionPane.QUESTION_MESSAGE, null,
+            printers.toArray(), printers.get(0));
+
+        if (selected == null) return;
+
+        // 构建测试页 HTML（与 CLodop WS 协议格式一致）
+        String testHtml = "<div style=\"font-family:'微软雅黑';color:#000000;text-align:center;\">" +
+            "<h2>打印测试页</h2>" +
+            "<p>打印机：" + selected + "</p>" +
+            "<p>时间：" + LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")) + "</p>" +
+            "<hr style=\"border:1px solid #000000;\">" +
+            "<table border=\"1\" style=\"width:80%;margin:0 auto;border-collapse:collapse;border:1px solid #000000;\">" +
+            "<tr><td style=\"border:1px solid #000000;padding:5px;\">测试行1</td>" +
+            "<td style=\"border:1px solid #000000;padding:5px;\">测试数据</td></tr>" +
+            "<tr><td style=\"border:1px solid #000000;padding:5px;\">测试行2</td>" +
+            "<td style=\"border:1px solid #000000;padding:5px;\">测试数据</td></tr>" +
+            "</table></div>";
+
+        String taskId = generateTaskId();
+        String message = buildClodopMessage(taskId, "打印测试页", selected,
+            "1", "0", "0", "A4", testHtml);
+
+        boolean ok = sendToClodopAndWait(message, 10000);
+
+        if (ok) {
+            JOptionPane.showMessageDialog(null, "测试页打印成功！", "打印测试页", JOptionPane.INFORMATION_MESSAGE);
+        } else {
+            JOptionPane.showMessageDialog(null,
+                "测试页打印失败！请确认 CLodop 服务已启动且打印机可用。",
+                "打印测试页", JOptionPane.WARNING_MESSAGE);
+        }
+    }
+
+    // ============ 主入口 ============
+
+    public static void main(String[] args) {
+        int udpPort = UDP_PORT;
+
+        for (int i = 0; i < args.length; i++) {
+            if ("--udp".equals(args[i]) && i + 1 < args.length) {
+                udpPort = Integer.parseInt(args[i + 1]);
+            }
+        }
+
+        System.out.println("=================================================");
+        System.out.println("  LodopUdpBridge —— 局域网打印网关（纯后台版）");
+        System.out.println("  UDP 端口: " + udpPort);
+        System.out.println("  C-Lodop: " + CLODOP_WS_URL);
+        System.out.println("  无浏览器桥页面，纯后台运行 + 系统托盘");
+        System.out.println("=================================================");
+
+        // 启动时先获取打印机列表
+        System.out.println("正在连接 CLodop 获取打印机列表...");
+        List<String> printers = listPrintersFromClodop();
+        synchronized (printerList) {
+            printerList.addAll(printers);
+        }
+        clodopConnected = !printers.isEmpty();
+        if (clodopConnected) {
+            System.out.println("✓ CLodop 已连接（" + printers.size() + " 台打印机）");
+            for (String p : printers) {
+                System.out.println("  - " + p);
+            }
+        } else {
+            System.out.println("⚠ CLodop 未启动，使用系统打印机列表（" + printerList.size() + " 台）");
+            System.out.println("  请先启动 C-Lodop（运行 CLodop打印服务.exe）");
+        }
+
+        // 启动系统托盘
+        if (SystemTray.isSupported()) {
+            initTray();
+            updateTrayTooltip();
+        } else {
+            System.out.println("⚠ 系统不支持托盘图标");
+        }
+
+        // 启动 UDP 监听（主线程）
+        startUdpServer(udpPort);
+    }
+
+    // ============ UDP 服务器 ============
+
+    static void startUdpServer(int port) {
+        System.out.println("正在启动 UDP 监听（端口 " + port + "）...");
+        try (DatagramSocket socket = new DatagramSocket(port)) {
+            socket.setSoTimeout(0);
+            System.out.println("✓ UDP 监听已启动，等待 App 发送 DISCOVER/PRINT 消息...");
+            System.out.println();
+
+            byte[] buf = new byte[65535];
+            while (true) {
+                DatagramPacket packet = new DatagramPacket(buf, buf.length);
+                socket.receive(packet);
+
+                String message = new String(
+                    packet.getData(), 0, packet.getLength(), StandardCharsets.UTF_8);
+
+                String senderIp = packet.getAddress().getHostAddress();
+                System.out.println("[UDP] 收到来自 " + senderIp +
+                    " 的消息（" + message.length() + " 字节）");
+
+                // 在新线程处理，避免阻塞接收
+                new Thread(() -> handleUdpMessage(socket, packet, message), "UdpHandler").start();
+            }
+        } catch (SocketException e) {
+            System.err.println("UDP Socket 错误: " + e.getMessage());
+            System.err.println("请检查端口 " + port + " 是否被占用。");
+            showNotification("LodopUdpBridge 错误", "UDP 端口 " + port + " 被占用");
+        } catch (IOException e) {
+            System.err.println("IO 错误: " + e.getMessage());
+        }
+    }
+}
