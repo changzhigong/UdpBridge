@@ -30,18 +30,5 @@
             android:label="打印预览"
             android:theme="@style/Theme.PrintTerminal" />
 
-        <!-- 系统级打印服务 -->
-        <service
-            android:name=".PrintService"
-            android:permission="android.permission.BIND_PRINT_SERVICE"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="android.printservice.PrintService" />
-            </intent-filter>
-            <meta-data
-                android:name="android.printservice"
-                android:resource="@xml/printservice" />
-        </service>
-
     </application>
 </manifest>
