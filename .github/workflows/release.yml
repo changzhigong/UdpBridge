@@ -151,4 +151,4 @@ jobs:
             echo "ERROR: no release files found"
             exit 1
           fi
-          gh release create "$TAG" $FILES --generate-notes --title "LodopUdpBridge $TAG"
+          gh release create "$TAG" $FILES --repo changzhigong/UdpBridge --generate-notes --title "LodopUdpBridge $TAG"
