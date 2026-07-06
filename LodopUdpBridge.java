@@ -125,6 +125,9 @@ public class LodopUdpBridge {
     static List<String> printerList = new ArrayList<>();
     static boolean clodopConnected = false;
 
+    // 单实例锁文件（防止重复启动导致端口 51010 被占用）
+    static File instanceLockFile;
+
     // ============ Task ID 生成（修正 #1）============
 
     static String generateTaskId() {
@@ -810,6 +813,56 @@ public class LodopUdpBridge {
         }
     }
 
+    // ============ 单实例锁 ============
+    // 防止重复启动导致 UDP 端口 51010 被占用（旧进程残留 / 多次点击启动）
+
+    static boolean acquireInstanceLock() {
+        try {
+            String appData = System.getenv("APPDATA");
+            if (appData == null) appData = ".";
+            File dir = new File(appData, "LodopUdpBridge");
+            if (!dir.exists()) dir.mkdirs();
+            instanceLockFile = new File(dir, "lodop.lock");
+
+            if (instanceLockFile.exists()) {
+                String pidStr = readFirstLine(instanceLockFile);
+                if (pidStr != null && isProcessAlive(pidStr)) {
+                    return false; // 另一个实例正在运行
+                }
+                // 锁文件残留（进程已死），删除后重新获取
+                instanceLockFile.delete();
+            }
+
+            try (FileWriter w = new FileWriter(instanceLockFile)) {
+                w.write(String.valueOf(ProcessHandle.current().pid()));
+            }
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                try { if (instanceLockFile != null && instanceLockFile.exists()) instanceLockFile.delete(); } catch (Exception ignored) {}
+            }));
+            return true;
+        } catch (Exception e) {
+            return true; // 锁文件机制为可选保护，失败时仍允许启动
+        }
+    }
+
+    static boolean isProcessAlive(String pidStr) {
+        try {
+            long pid = Long.parseLong(pidStr.trim());
+            ProcessHandle h = ProcessHandle.of(pid).orElse(null);
+            return h != null && h.isAlive();
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    static String readFirstLine(File f) {
+        try (BufferedReader r = new BufferedReader(new FileReader(f))) {
+            return r.readLine();
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
     // ============ 主入口 ============
 
     public static void main(String[] args) {
@@ -857,6 +910,13 @@ public class LodopUdpBridge {
             log("⚠ 系统不支持托盘图标");
         }
 
+        // 单实例校验：若已有同类实例占用端口，则静默退出，避免重复绑定冲突
+        if (!acquireInstanceLock()) {
+            log("检测到另一个实例已在运行（端口 " + udpPort + " 已被占用），本实例退出以避免冲突。");
+            showNotification("LodopUdpBridge", "已在运行，无需重复启动");
+            System.exit(0);
+        }
+
         // 启动 UDP 监听（主线程）
         startUdpServer(udpPort);
     }
@@ -865,15 +925,22 @@ public class LodopUdpBridge {
 
     static void startUdpServer(int port) {
         log("正在启动 UDP 监听（端口 " + port + "）...");
-        try (DatagramSocket socket = new DatagramSocket(port)) {
+        DatagramSocket socket = null;
+        try {
+            // 先创建未绑定 socket，开启 SO_REUSEADDR 再绑定，
+            // 避免上一次退出后端口处于 TIME_WAIT 导致的 "Address already in use"
+            socket = new DatagramSocket(null);
+            socket.setReuseAddress(true);
+            socket.bind(new InetSocketAddress(port));
             socket.setSoTimeout(0);
+            final DatagramSocket bound = socket;
             log("✓ UDP 监听已启动，等待 App 发送 DISCOVER/PRINT 消息...");
             log("");
 
             byte[] buf = new byte[65535];
             while (true) {
                 DatagramPacket packet = new DatagramPacket(buf, buf.length);
-                socket.receive(packet);
+                bound.receive(packet);
 
                 String message = new String(
                     packet.getData(), 0, packet.getLength(), StandardCharsets.UTF_8);
@@ -883,14 +950,19 @@ public class LodopUdpBridge {
                     " 的消息（" + message.length() + " 字节） | cmd=" + extractJsonField(message, "cmd"));
 
                 // 在新线程处理，避免阻塞接收
-                new Thread(() -> handleUdpMessage(socket, packet, message), "UdpHandler").start();
+                new Thread(() -> handleUdpMessage(bound, packet, message), "UdpHandler").start();
             }
         } catch (SocketException e) {
             logErr("UDP Socket 错误: " + e.getMessage());
             logErr("请检查端口 " + port + " 是否被占用。");
             showNotification("LodopUdpBridge 错误", "UDP 端口 " + port + " 被占用");
+            System.exit(1);
         } catch (IOException e) {
             logErr("IO 错误: " + e.getMessage());
+        } finally {
+            if (socket != null) {
+                try { socket.close(); } catch (Exception ignored) {}
+            }
         }
     }
 }
