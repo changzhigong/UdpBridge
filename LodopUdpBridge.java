@@ -636,7 +636,7 @@ public class LodopUdpBridge {
         try {
             SystemTray tray = SystemTray.getSystemTray();
             Image icon = createTrayIcon();
-            trayIcon = new TrayIcon(icon, "LodopUdpBridge");
+            trayIcon = new TrayIcon(icon, "CLODOP 桥 51010");
             trayIcon.setImageAutoSize(true);
 
             PopupMenu popup = new PopupMenu();

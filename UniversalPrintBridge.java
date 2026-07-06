@@ -365,7 +365,7 @@ public class UniversalPrintBridge {
             exitItem.addActionListener(e -> { System.exit(0); });
             menu.add(exitItem);
 
-            TrayIcon icon = new TrayIcon(img, "通用打印网关(UDP:" + UDP_PORT + ")", menu);
+            TrayIcon icon = new TrayIcon(img, "通用打印 52010", menu);
             icon.setImageAutoSize(true);
             tray.add(icon);
             log("系统托盘已启动");

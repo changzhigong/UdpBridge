@@ -2,11 +2,11 @@
 ; 编译： "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" LodopUdpBridge.iss
 
 [Setup]
-AppName=Lodop UDP Bridge
-AppVersion=1.3
+AppName=打印网关
+AppVersion=1.4
 AppPublisher=郑州晖锦
-DefaultDirName={autopf}\LodopUdpBridge
-DefaultGroupName=Lodop UDP Bridge
+DefaultDirName={autopf}\打印网关
+DefaultGroupName=打印网关
 AllowNoIcons=yes
 OutputDir=installer-output
 OutputBaseFilename=LodopUdpBridge_Setup
@@ -32,17 +32,16 @@ Source: run_universal.bat; DestDir: {app}; Flags: ignoreversion
 Source: jre\*; DestDir: {app}\jre; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: {group}\Lodop UDP Bridge (CLODOP 桥 51010); Filename: {app}\launch.vbs; WorkingDir: {app}; IconFilename: {app}\launch.vbs
-Name: {group}\通用打印网关 (UDP 52010); Filename: {app}\run_universal.bat; WorkingDir: {app}
-Name: {group}\Lodop UDP Bridge (控制台); Filename: {app}\run.bat; WorkingDir: {app}
-Name: {group}\卸载 Lodop UDP Bridge; Filename: {uninstallexe}
-Name: {autodesktop}\Lodop UDP Bridge; Filename: {app}\launch.vbs; WorkingDir: {app}; Tasks: desktopicon
+Name: {group}\启动打印网关; Filename: {app}\launch.vbs; WorkingDir: {app}; IconFilename: {app}\launch.vbs
+Name: {group}\打印网关 (控制台); Filename: {app}\run.bat; WorkingDir: {app}
+Name: {group}\卸载; Filename: {uninstallexe}
+Name: {autodesktop}\启动打印网关; Filename: {app}\launch.vbs; WorkingDir: {app}; Tasks: desktopicon
 
 [Registry]
-Root: HKCU; Subkey: Software\Microsoft\Windows\CurrentVersion\Run; ValueType: string; ValueName: LodopUdpBridge; ValueData: """{app}\launch.vbs"""; Flags: uninsdeletevalue; Tasks: autostart
+Root: HKCU; Subkey: Software\Microsoft\Windows\CurrentVersion\Run; ValueType: string; ValueName: 打印网关; ValueData: """{app}\launch.vbs"""; Flags: uninsdeletevalue; Tasks: autostart
 
 [Run]
-Filename: {app}\launch.vbs; Description: 启动 Lodop UDP Bridge（后台静默运行）; Flags: nowait postinstall runascurrentuser shellexec
+Filename: {app}\launch.vbs; Description: 启动打印网关（CLODOP 51010 + 通用 52010）; Flags: nowait postinstall runascurrentuser shellexec
 
 [Code]
 // 卸载完成后确认是否删除配置数据和日志文件

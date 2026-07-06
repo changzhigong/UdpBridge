@@ -37,5 +37,7 @@ android-print-terminal/**/*.apk
 *.jks
 
 # === 下载的成品(不入库) ===
+LodopUdpBridge_Setup.exe
 LodopUdpBridge_Setup_*.exe
+PrintTerminal.apk
 PrintTerminal_*.apk
