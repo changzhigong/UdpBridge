@@ -36,6 +36,27 @@ jobs:
           jar cfe LodopUdpBridge.jar LodopUdpBridge LodopUdpBridge.class LodopUdpBridge$1.class LodopUdpBridge$2.class LodopUdpBridge$3.class
           dir LodopUdpBridge.jar
 
+      - name: Compile UniversalPrintBridge
+        shell: cmd
+        run: |
+          javac -cp "lib/pdfbox-2.0.30.jar;lib/fontbox-2.0.30.jar;lib/commons-logging-1.2.jar" --release 17 -encoding UTF-8 UniversalPrintBridge.java
+          echo "UniversalPrintBridge compiled"
+          dir UniversalPrintBridge*.class
+
+      - name: Package UniversalPrintBridge ZIP
+        shell: powershell
+        run: |
+          $zipDir = "universal-print-bridge"
+          New-Item -ItemType Directory -Force -Path $zipDir | Out-Null
+          Copy-Item UniversalPrintBridge*.class $zipDir/
+          Copy-Item run_universal_bridge.bat $zipDir/
+          New-Item -ItemType Directory -Force -Path "$zipDir/lib" | Out-Null
+          Copy-Item lib/pdfbox-2.0.30.jar "$zipDir/lib/"
+          Copy-Item lib/fontbox-2.0.30.jar "$zipDir/lib/"
+          Copy-Item lib/commons-logging-1.2.jar "$zipDir/lib/"
+          Compress-Archive -Path "$zipDir/*" -DestinationPath "universal-print-bridge.zip"
+          Write-Host "ZIP created: $((Get-Item universal-print-bridge.zip).Length) bytes"
+
       - name: Generate JRE with jlink
         shell: cmd
         run: |
@@ -71,11 +92,13 @@ jobs:
             throw "Setup.exe not found at $exe"
           }
 
-      - name: Upload build artifact
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: LodopUdpBridge_Setup
-          path: installer/installer-output/LodopUdpBridge_Setup.exe
+          path: |
+            installer/installer-output/LodopUdpBridge_Setup.exe
+            universal-print-bridge.zip
           retention-days: 30
 
       - name: Create GitHub Release
@@ -88,5 +111,6 @@ jobs:
           echo "Creating release for tag: $TAG"
           gh release create "$TAG" \
             installer/installer-output/LodopUdpBridge_Setup.exe \
+            universal-print-bridge.zip \
             --generate-notes \
             --title "LodopUdpBridge $TAG"

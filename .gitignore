@@ -2,6 +2,9 @@
 *.class
 *.jar
 
+# === 例外：保留 lib 目录的依赖 JAR ===
+!lib/*.jar
+
 # === WiX 中间产物 ===
 *.wixobj
 *.wixpdb

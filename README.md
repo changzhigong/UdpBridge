@@ -8,10 +8,24 @@
 App（移动端）→ UDP(51010) → Java Bridge → WebSocket(CLODOP) → C-Lodop → 针式打印机
 ```
 
+### LodopUdpBridge (CLODOP 桥,端口 51010)
+
 - **UDP 端口**：`51010`（局域网广播发现 + 打印任务下发）
 - **C-Lodop WS**：`ws://127.0.0.1:8000/c_webskt/`
 - **运行方式**：纯后台 + 系统托盘图标，无浏览器、无 HTTP 服务器
 - **日志路径**：`%APPDATA%/LodopUdpBridge/bridge.log`
+- **运行脚本**：`run_lodop_bridge.bat`
+
+### UniversalPrintBridge (通用打印网关,端口 52010)
+
+- **UDP 端口**：`52010`（安卓端直连，无需 C-Lodop）
+- **打印方式**：Windows 原生 `javax.print` API（不依赖 C-Lodop）
+- **自动识别**：魔术字节检测 PDF / PNG / JPEG / TEXT，无需 type 字段
+- **打印队列**：单线程队列，非阻塞返回 ACK
+- **失败重试**：3 次自动重试
+- **打印预览**：Swing 弹窗预览（`PREVIEW` 命令）
+- **运行脚本**：`run_universal_bridge.bat`
+- **依赖**：PDFBox (lib/pdfbox-2.0.30.jar, lib/fontbox-2.0.30.jar, commons-logging)
 
 ## 技术栈
 
@@ -45,24 +59,79 @@ LodopUdpBridge/
 └── .github/workflows/release.yml # GitHub Actions 自动发版
 ```
 
+## 通用打印网关协议 (UniversalPrintBridge)
+
+UDP 端口 **52010**，JSON 格式指令 + 原始二进制数据。
+
+### LIST - 列出打印机
+
+```
+请求: {"cmd":"LIST"}
+响应: {"cmd":"LIST","printers":[{"name":"HP LaserJet Pro","default":true},{"name":"EPSON LQ-630K","default":false}]}
+```
+
+### PRINT - 提交打印任务
+
+JSON 在包头，原始打印数据紧跟其后（JSON 字节之后的所有字节为打印数据）。
+
+```
+请求: {"cmd":"PRINT","prn":"EPSON LQ-630K","copies":2}...原始打印数据...
+响应: {"status":"QUEUED","prn":"EPSON LQ-630K","type":"PDF"}
+       {"status":"DONE"} 或 {"status":"FAIL","msg":"未找到打印机"}
+```
+
+**参数说明**：
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| cmd | ✓ | `PRINT` |
+| prn | ✓ | 打印机名称（与 LIST 返回一致） |
+| copies | ✗ | 打印份数，默认 1 |
+
+**支持格式**（自动检测，无需 type 字段）：
+
+| 格式 | 魔术字节 | 打印方式 |
+|------|---------|---------|
+| PDF | `%PDF` (0x25504446) | PDFBox 渲染 |
+| PNG | `\x89PNG` | ImageIO + PrinterJob |
+| JPEG | `\xFF\xD8` | ImageIO + PrinterJob |
+| 文本 | 其他 | UTF-8 → javax.print |
+
+### PREVIEW - 打印前预览
+
+```
+请求: {"cmd":"PREVIEW","prn":"EPSON LQ-630K"}...原始打印数据...
+响应: {"status":"PREVIEW","type":"PDF"}
+→ PC 端弹出预览窗口
+```
+
 ## 本地编译
 
 ### 前置要求
 
 - JDK 17+（不是 JRE）
-- Inno Setup 6（`C:\Program Files (x86)\Inno Setup 6\ISCC.exe`）
+- PDFBox 依赖（lib/ 目录已包含，或在 CI 构建时下载）
+- Inno Setup 6（仅 LodopUdpBridge 安装包构建需要）
 
-### 编译步骤
+### LodopUdpBridge 编译
 
 ```cmd
-# 1. 编译 Java 源码
 cd installer
 javac --release 17 -encoding UTF-8 -d . ..\LodopUdpBridge.java
-
-# 2. 打包 JAR
 jar cfe LodopUdpBridge.jar LodopUdpBridge LodopUdpBridge.class LodopUdpBridge$1.class LodopUdpBridge$2.class LodopUdpBridge$3.class
+```
 
-# 3. 生成 JRE（jlink）
+### UniversalPrintBridge 编译
+
+```cmd
+# 1. 编译
+javac -cp "lib/pdfbox-2.0.30.jar;lib/fontbox-2.0.30.jar;lib/commons-logging-1.2.jar" --release 17 -encoding UTF-8 UniversalPrintBridge.java
+
+# 2. 运行
+java -cp ".;lib/pdfbox-2.0.30.jar;lib/fontbox-2.0.30.jar;lib/commons-logging-1.2.jar" UniversalPrintBridge
+
+# 或直接双击 run_universal_bridge.bat
+```
 jlink --add-modules java.base,java.datatransfer,java.xml,java.prefs,java.desktop,java.logging,java.net.http --output jre --strip-debug --no-header-files --no-man-pages --compress=2
 
 # 4. 编译安装包
