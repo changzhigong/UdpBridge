@@ -27,3 +27,15 @@ dist-bridge/innosetup.exe
 
 # === WorkBuddy 工作空间元数据 ===
 .workbuddy/
+
+# === Android 构建产物 ===
+android-print-terminal/**/build/
+android-print-terminal/**/*.apk
+
+# === 签名密钥(不入库) ===
+*.keystore
+*.jks
+
+# === 下载的成品(不入库) ===
+LodopUdpBridge_Setup_*.exe
+PrintTerminal_*.apk

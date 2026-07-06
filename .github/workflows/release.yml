@@ -98,18 +98,37 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
+      - name: Decode keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > android-print-terminal/app/fycrg-app-release-key.keystore
+            echo "Keystore decoded"
+          else
+            echo "WARNING: KEYSTORE_BASE64 not set, APK will be unsigned"
+          fi
+
       - name: Generate Gradle wrapper
         working-directory: android-print-terminal
         run: gradle wrapper --gradle-version 8.7
 
-      - name: Build APK
+      - name: Build signed APK
         working-directory: android-print-terminal
+        env:
+          KEYSTORE_FILE: ${{ github.workspace }}/android-print-terminal/app/fycrg-app-release-key.keystore
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: ./gradlew assembleRelease
 
       - name: Find APK
         id: apk
         run: |
-          APK=$(find android-print-terminal -name "*.apk" | head -1)
+          APK=$(find android-print-terminal -name "*.apk" | grep -v unsigned | head -1)
+          if [ -z "$APK" ]; then
+            APK=$(find android-print-terminal -name "*.apk" | head -1)
+          fi
           echo "apk=$APK" >> $GITHUB_OUTPUT
           echo "APK: $APK"
 
