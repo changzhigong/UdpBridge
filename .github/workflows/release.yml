@@ -5,19 +5,14 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
-    inputs:
-      skip_release:
-        description: '跳过创建 Release（仅构建 artifact）'
-        required: false
-        default: 'false'
 
 permissions:
   contents: write
 
 jobs:
-  build:
+  # ==================== PC 端构建 ====================
+  pc-build:
     runs-on: windows-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -28,7 +23,7 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Compile Java and build JAR
+      - name: Compile LodopUdpBridge JAR
         shell: cmd
         run: |
           cd installer
@@ -36,35 +31,27 @@ jobs:
           jar cfe LodopUdpBridge.jar LodopUdpBridge LodopUdpBridge.class LodopUdpBridge$1.class LodopUdpBridge$2.class LodopUdpBridge$3.class
           dir LodopUdpBridge.jar
 
-      - name: Compile UniversalPrintBridge
+      - name: Compile UniversalPrintBridge JAR
         shell: cmd
         run: |
-          javac -cp "lib/pdfbox-2.0.30.jar;lib/fontbox-2.0.30.jar;lib/commons-logging-1.2.jar" --release 17 -encoding UTF-8 UniversalPrintBridge.java
-          echo "UniversalPrintBridge compiled"
-          dir UniversalPrintBridge*.class
+          javac -cp "lib/pdfbox-2.0.30.jar;lib/fontbox-2.0.30.jar;lib/commons-logging-1.2.jar" --release 17 -encoding UTF-8 -d installer UniversalPrintBridge.java
+          cd installer
+          jar cfe UniversalPrintBridge.jar UniversalPrintBridge UniversalPrintBridge.class UniversalPrintBridge$PrintQueue.class UniversalPrintBridge$PrintTask.class UniversalPrintBridge$PrintType.class UniversalPrintBridge$1.class
+          dir UniversalPrintBridge.jar
+          mkdir lib 2>nul
+          copy ..\lib\pdfbox-2.0.30.jar lib\
+          copy ..\lib\fontbox-2.0.30.jar lib\
+          copy ..\lib\commons-logging-1.2.jar lib\
+          copy ..\run_universal_bridge.bat run_universal.bat
 
-      - name: Package UniversalPrintBridge ZIP
-        shell: powershell
-        run: |
-          $zipDir = "universal-print-bridge"
-          New-Item -ItemType Directory -Force -Path $zipDir | Out-Null
-          Copy-Item UniversalPrintBridge*.class $zipDir/
-          Copy-Item run_universal_bridge.bat $zipDir/
-          New-Item -ItemType Directory -Force -Path "$zipDir/lib" | Out-Null
-          Copy-Item lib/pdfbox-2.0.30.jar "$zipDir/lib/"
-          Copy-Item lib/fontbox-2.0.30.jar "$zipDir/lib/"
-          Copy-Item lib/commons-logging-1.2.jar "$zipDir/lib/"
-          Compress-Archive -Path "$zipDir/*" -DestinationPath "universal-print-bridge.zip"
-          Write-Host "ZIP created: $((Get-Item universal-print-bridge.zip).Length) bytes"
-
-      - name: Generate JRE with jlink
+      - name: Generate JRE
         shell: cmd
         run: |
           cd installer
           jlink --add-modules java.base,java.datatransfer,java.xml,java.prefs,java.desktop,java.logging,java.net.http --output jre --strip-debug --no-header-files --no-man-pages --compress=2
           dir jre\bin\javaw.exe
 
-      - name: Compile Inno Setup installer
+      - name: Compile Inno Setup
         shell: powershell
         run: |
           Set-Location installer
@@ -79,38 +66,89 @@ jobs:
           }
           Write-Host "Using ISCC: $iscc"
           & $iscc "LodopUdpBridge.iss"
-          if ($LASTEXITCODE -ne 0) { throw "ISCC compile failed with exit code $LASTEXITCODE" }
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
 
       - name: Verify artifact
         shell: powershell
         run: |
           $exe = "installer\installer-output\LodopUdpBridge_Setup.exe"
-          if (Test-Path $exe) {
-            $size = (Get-Item $exe).Length
-            Write-Host "Setup.exe size: $([math]::Round($size/1MB, 2)) MB"
-          } else {
-            throw "Setup.exe not found at $exe"
-          }
+          if (-not (Test-Path $exe)) { throw "Setup.exe not found" }
+          Write-Host "Setup.exe: $([math]::Round((Get-Item $exe).Length/1MB, 2)) MB"
 
-      - name: Upload build artifacts
+      - name: Upload PC artifact
         uses: actions/upload-artifact@v4
         with:
-          name: LodopUdpBridge_Setup
-          path: |
-            installer/installer-output/LodopUdpBridge_Setup.exe
-            universal-print-bridge.zip
+          name: pc-setup
+          path: installer/installer-output/LodopUdpBridge_Setup.exe
           retention-days: 30
 
+  # ==================== Android 端构建 ====================
+  android-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Generate Gradle wrapper
+        working-directory: android-print-terminal
+        run: gradle wrapper --gradle-version 8.7
+
+      - name: Build APK
+        working-directory: android-print-terminal
+        run: ./gradlew assembleRelease
+
+      - name: Find APK
+        id: apk
+        run: |
+          APK=$(find android-print-terminal -name "*.apk" | head -1)
+          echo "apk=$APK" >> $GITHUB_OUTPUT
+          echo "APK: $APK"
+
+      - name: Upload Android artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: ${{ steps.apk.outputs.apk }}
+          retention-days: 30
+
+  # ==================== 创建 Release ====================
+  release:
+    needs: [pc-build, android-build]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Download PC artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: pc-setup
+
+      - name: Download Android artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: android-apk
+
+      - name: List artifacts
+        run: ls -la *.exe *.apk 2>/dev/null || echo "Checking files..."; ls -la
+
       - name: Create GitHub Release
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="${GITHUB_REF#refs/tags/}"
           echo "Creating release for tag: $TAG"
-          gh release create "$TAG" \
-            installer/installer-output/LodopUdpBridge_Setup.exe \
-            universal-print-bridge.zip \
-            --generate-notes \
-            --title "LodopUdpBridge $TAG"
+          FILES=$(ls *.exe *.apk 2>/dev/null | tr '\n' ' ')
+          if [ -z "$FILES" ]; then
+            echo "ERROR: no release files found"
+            exit 1
+          fi
+          gh release create "$TAG" $FILES --generate-notes --title "LodopUdpBridge $TAG"

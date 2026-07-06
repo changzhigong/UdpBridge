@@ -3,7 +3,7 @@
 
 [Setup]
 AppName=Lodop UDP Bridge
-AppVersion=1.2
+AppVersion=1.3
 AppPublisher=郑州晖锦
 DefaultDirName={autopf}\LodopUdpBridge
 DefaultGroupName=Lodop UDP Bridge
@@ -24,12 +24,16 @@ Name: desktopicon; Description: 创建桌面快捷方式（后台静默运行）
 
 [Files]
 Source: LodopUdpBridge.jar; DestDir: {app}; Flags: ignoreversion
+Source: UniversalPrintBridge.jar; DestDir: {app}; Flags: ignoreversion
+Source: lib\*; DestDir: {app}\lib; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: launch.vbs; DestDir: {app}; Flags: ignoreversion
 Source: run.bat; DestDir: {app}; Flags: ignoreversion
+Source: run_universal.bat; DestDir: {app}; Flags: ignoreversion
 Source: jre\*; DestDir: {app}\jre; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: {group}\Lodop UDP Bridge; Filename: {app}\launch.vbs; WorkingDir: {app}; IconFilename: {app}\launch.vbs
+Name: {group}\Lodop UDP Bridge (CLODOP 桥 51010); Filename: {app}\launch.vbs; WorkingDir: {app}; IconFilename: {app}\launch.vbs
+Name: {group}\通用打印网关 (UDP 52010); Filename: {app}\run_universal.bat; WorkingDir: {app}
 Name: {group}\Lodop UDP Bridge (控制台); Filename: {app}\run.bat; WorkingDir: {app}
 Name: {group}\卸载 Lodop UDP Bridge; Filename: {uninstallexe}
 Name: {autodesktop}\Lodop UDP Bridge; Filename: {app}\launch.vbs; WorkingDir: {app}; Tasks: desktopicon
