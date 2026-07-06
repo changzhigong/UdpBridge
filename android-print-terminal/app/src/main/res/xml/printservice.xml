@@ -1,0 +1,6 @@
+<print-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:settingsActivity=".MainActivity"
+    android:vendor="FY"
+    android:name="局域网打印网关"
+    android:versionCode="1"
+    android:versionName="1.0" />

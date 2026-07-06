@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- 网络权限 -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+
+    <application
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="打印终端"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.PrintTerminal">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="打印终端"
+            android:launchMode="singleTop">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".PrintPreviewActivity"
+            android:label="打印预览"
+            android:theme="@style/Theme.PrintTerminal" />
+
+        <!-- 系统级打印服务 -->
+        <service
+            android:name=".PrintService"
+            android:permission="android.permission.BIND_PRINT_SERVICE"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.printservice.PrintService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.printservice"
+                android:resource="@xml/printservice" />
+        </service>
+
+    </application>
+</manifest>

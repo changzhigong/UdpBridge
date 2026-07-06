@@ -1,0 +1,15 @@
+<resources>
+    <string name="app_name">打印终端</string>
+    <string name="scan">扫描网关</string>
+    <string name="select_printer">请选择打印机</string>
+    <string name="print">打印</string>
+    <string name="preview">预览</string>
+    <string name="gateway_found">已连接: %1$s (%2$s)</string>
+    <string name="gateway_not_found">未发现打印网关</string>
+    <string name="gateway_scanning">正在扫描...</string>
+    <string name="printer_count">%d 台打印机</string>
+    <string name="print_success">打印成功</string>
+    <string name="print_fail">打印失败</string>
+    <string name="no_print_data">请先选择打印内容</string>
+    <string name="no_printer">请先选择打印机</string>
+</resources>

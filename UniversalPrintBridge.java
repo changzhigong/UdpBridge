@@ -1,23 +1,25 @@
 // UniversalPrintBridge.java
 // 通用打印网关 - Windows 原生打印服务
-// 编译: javac -cp ".;lib/pdfbox-2.0.30.jar;lib/fontbox-2.0.30.jar" UniversalPrintBridge.java
-// 运行: java -cp ".;lib/pdfbox-2.0.30.jar;lib/fontbox-2.0.30.jar" UniversalPrintBridge
+// 编译: javac -cp ".;lib/pdfbox-2.0.30.jar;lib/fontbox-2.0.30.jar;lib/commons-logging-1.2.jar" UniversalPrintBridge.java
+// 运行: java -cp ".;lib/pdfbox-2.0.30.jar;lib/fontbox-2.0.30.jar;lib/commons-logging-1.2.jar" UniversalPrintBridge
 //
 // 功能:
 //   - UDP 52010 端口监听安卓端打印请求
 //   - 自动检测打印类型(PDF / PNG / JPEG / TEXT)，无需 type 字段
+//   - 同时支持 Base64 协议(type+data 字段)，兼容安卓端 Bitmap → Base64 一行打印
 //   - 打印队列 + 失败自动重试(3次)
-//   - 打印前预览(Swing 窗口)
 //   - 系统托盘后台运行
 //   - Windows 原生 javax.print 驱动打印机
+//   - 预览功能移至安卓端，PC 端纯后台打印
 //
 // 协议:
+//   - DISCOVER:{"cmd":"DISCOVER"}
+//             响应: {"cmd":"DISCOVER_ACK","hostname":"PC","ip":"192.168.1.x","port":52010,"printers":[...]}
 //   - LIST:   {"cmd":"LIST"}
-//             响应: {"printers":[{"name":"HP","default":true},...]}
-//   - PRINT:  {"cmd":"PRINT","prn":"HP","copies":1} + 原始打印数据
-//             响应: {"status":"QUEUED","prn":"HP"} / {"status":"DONE"} / {"status":"FAIL","msg":"..."}
-//   - PREVIEW:{"cmd":"PREVIEW","prn":"HP"} + 原始打印数据
-//             响应: {"status":"PREVIEW"} -> 弹出预览窗口
+//             响应: {"cmd":"LIST","printers":[{"name":"HP","default":true},...]}
+//   - PRINT:  方式A: {"cmd":"PRINT","prn":"HP","copies":1} + 原始二进制数据(JSON后)
+//             方式B: {"cmd":"PRINT","type":"IMAGE","printer":"HP","copies":2,"data":"<base64>"}
+//             响应: {"status":"QUEUED","prn":"HP","type":"PDF"} → {"status":"DONE"} / {"status":"FAIL"}
 
 import java.awt.*;
 import java.awt.event.*;
@@ -32,7 +34,6 @@ import javax.imageio.ImageIO;
 import javax.print.*;
 import javax.print.attribute.*;
 import javax.print.attribute.standard.*;
-import javax.swing.*;
 
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.printing.PDFPrintable;
@@ -193,53 +194,6 @@ public class UniversalPrintBridge {
         }
     }
 
-    // ==================== 预览窗口 ====================
-    static void showPreview(byte[] data, PrintType type) {
-        SwingUtilities.invokeLater(() -> {
-            JFrame frame = new JFrame("打印预览");
-            frame.setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE);
-            frame.setSize(750, 900);
-            frame.setLocationRelativeTo(null);
-
-            if (type == PrintType.IMAGE) {
-                try {
-                    BufferedImage img = ImageIO.read(new ByteArrayInputStream(data));
-                    if (img != null) {
-                        JLabel label = new JLabel(new ImageIcon(img));
-                        frame.add(new JScrollPane(label));
-                    } else {
-                        frame.add(new JLabel("图片加载失败", JLabel.CENTER));
-                    }
-                } catch (Exception e) {
-                    frame.add(new JLabel("图片加载失败: " + e.getMessage(), JLabel.CENTER));
-                }
-            } else if (type == PrintType.PDF) {
-                try {
-                    PDDocument doc = PDDocument.load(data);
-                    int pages = doc.getNumberOfPages();
-                    doc.close();
-                    JEditorPane pane = new JEditorPane("text/html",
-                        "<html><body style='font-family:sans-serif;padding:40px'>" +
-                        "<h2>PDF 文档</h2>" +
-                        "<p>页数: " + pages + "</p>" +
-                        "<p style='color:#666'>PDF不支持图文预览,将直接发送到打印机</p>" +
-                        "</body></html>");
-                    pane.setEditable(false);
-                    frame.add(new JScrollPane(pane));
-                } catch (Exception e) {
-                    frame.add(new JLabel("PDF 解析失败", JLabel.CENTER));
-                }
-            } else {
-                JTextArea area = new JTextArea();
-                area.setFont(new Font("Monospaced", Font.PLAIN, 13));
-                area.setEditable(false);
-                area.setText(new String(data, StandardCharsets.UTF_8));
-                frame.add(new JScrollPane(area));
-            }
-            frame.setVisible(true);
-        });
-    }
-
     // ==================== 工具方法 ====================
 
     // 自动检测打印类型(魔术字节)
@@ -331,6 +285,52 @@ public class UniversalPrintBridge {
         return null;
     }
 
+    // 提取长字段值(如 Base64 编码的 data 字段)
+    static String jsonGetLongField(String json, String field) {
+        String pattern = "\"" + field + "\"\\s*:\\s*\"";
+        int idx = json.indexOf(pattern);
+        if (idx < 0) return null;
+        int start = idx + pattern.length();
+        StringBuilder sb = new StringBuilder();
+        for (int i = start; i < json.length(); i++) {
+            char c = json.charAt(i);
+            if (c == '\\' && i + 1 < json.length()) {
+                char n = json.charAt(i + 1);
+                if (n == '"') { sb.append('"'); i++; }
+                else if (n == '\\') { sb.append('\\'); i++; }
+                else if (n == 'n') { sb.append('\n'); i++; }
+                else if (n == 'r') { sb.append('\r'); i++; }
+                else if (n == 't') { sb.append('\t'); i++; }
+                else sb.append(c);
+            } else if (c == '"') {
+                return sb.toString();
+            } else {
+                sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+
+    // 获取本机局域网 IP 地址
+    static String getLocalIP() {
+        try {
+            Enumeration<NetworkInterface> ifaces = NetworkInterface.getNetworkInterfaces();
+            while (ifaces.hasMoreElements()) {
+                NetworkInterface iface = ifaces.nextElement();
+                if (iface.isLoopback() || !iface.isUp()) continue;
+                Enumeration<InetAddress> addrs = iface.getInetAddresses();
+                while (addrs.hasMoreElements()) {
+                    InetAddress a = addrs.nextElement();
+                    if (a instanceof java.net.Inet4Address && !a.isLoopbackAddress()) {
+                        return a.getHostAddress();
+                    }
+                }
+            }
+        } catch (Exception e) { /* fallback */ }
+        try { return InetAddress.getLocalHost().getHostAddress(); }
+        catch (Exception e) { return "127.0.0.1"; }
+    }
+
     // ==================== 日志 ====================
     static void log(String msg) {
         String time = new java.text.SimpleDateFormat("HH:mm:ss").format(new Date());
@@ -419,7 +419,18 @@ public class UniversalPrintBridge {
                 String cmdJson = parsed[0];
                 String cmd = jsonGet(cmdJson, "cmd");
 
-                if ("LIST".equals(cmd)) {
+                if ("DISCOVER".equals(cmd)) {
+                    // 局域网广播发现
+                    String hostname = InetAddress.getLocalHost().getHostName();
+                    String ip = getLocalIP();
+                    String printers = listPrinters();
+                    String resp = "{\"cmd\":\"DISCOVER_ACK\",\"hostname\":\"" + escapeJson(hostname)
+                        + "\",\"ip\":\"" + ip + "\",\"port\":" + UDP_PORT
+                        + ",\"printers\":" + printers + "}";
+                    sendJson(socket, addr, rport, resp);
+                    log("DISCOVER from " + addr.getHostAddress() + ":" + rport + " -> ip=" + ip);
+
+                } else if ("LIST".equals(cmd)) {
                     // 列出打印机
                     String printers = listPrinters();
                     String resp = "{\"cmd\":\"LIST\",\"printers\":" + printers + "}";
@@ -427,39 +438,59 @@ public class UniversalPrintBridge {
                     log("LIST -> " + addr.getHostAddress() + ":" + rport);
 
                 } else if ("PRINT".equals(cmd)) {
-                    // 打印任务
+                    // 打印任务 - 支持两种协议:
+                    // 方式A: JSON + 原始二进制数据(JSON 头后面直接跟数据)
+                    // 方式B: JSON 内嵌 Base64(type + data 字段)
                     String prn = jsonGet(cmdJson, "prn");
+                    if (prn == null || prn.isEmpty()) prn = jsonGet(cmdJson, "printer");
                     if (prn == null || prn.isEmpty()) {
-                        sendJson(socket, addr, rport, "{\"status\":\"FAIL\",\"msg\":\"missing prn\"}");
+                        sendJson(socket, addr, rport, "{\"status\":\"FAIL\",\"msg\":\"missing printer\"}");
                         continue;
                     }
                     String copiesStr = jsonGet(cmdJson, "copies");
                     int copies = (copiesStr != null) ? Integer.parseInt(copiesStr) : 1;
 
-                    // 提取二进制数据(JSON 后面部分)
-                    int jsonEnd = Integer.parseInt(parsed[1]);
-                    byte[] payload = new byte[len - jsonEnd];
-                    System.arraycopy(buf, jsonEnd, payload, 0, payload.length);
+                    byte[] payload = null;
+                    PrintType type = null;
 
-                    PrintType type = detectType(payload);
+                    // 方式B: Base64 协议
+                    String typeStr = jsonGet(cmdJson, "type");
+                    String base64 = jsonGetLongField(cmdJson, "data");
+                    if (typeStr != null && base64 != null && !base64.isEmpty()) {
+                        try {
+                            payload = Base64.getDecoder().decode(base64);
+                        } catch (Exception e) {
+                            logErr("Base64 解码失败: " + e.getMessage());
+                            sendJson(socket, addr, rport, "{\"status\":\"FAIL\",\"msg\":\"base64 decode error\"}");
+                            continue;
+                        }
+                        if ("PDF".equalsIgnoreCase(typeStr)) type = PrintType.PDF;
+                        else if ("IMAGE".equalsIgnoreCase(typeStr)) type = PrintType.IMAGE;
+                        else type = PrintType.TEXT;
+                    }
+
+                    // 方式A: 原始二进制数据协议
+                    if (payload == null && parsed.length > 1 && !parsed[1].isEmpty()) {
+                        int jsonEnd = Integer.parseInt(parsed[1]);
+                        if (jsonEnd < len) {
+                            payload = new byte[len - jsonEnd];
+                            System.arraycopy(buf, jsonEnd, payload, 0, payload.length);
+                            type = detectType(payload);
+                        }
+                    }
+
+                    if (payload == null || payload.length == 0) {
+                        sendJson(socket, addr, rport, "{\"status\":\"FAIL\",\"msg\":\"no data\"}");
+                        continue;
+                    }
+                    if (type == null) type = detectType(payload);
+
                     log("PRINT prn=" + prn + " type=" + type + " size=" + payload.length + " copies=" + copies);
 
                     PrintTask task = new PrintTask(prn, payload, type, copies);
                     task.socket = socket; task.addr = addr; task.port = rport;
                     PrintQueue.INSTANCE.submit(task);
                     sendJson(socket, addr, rport, "{\"status\":\"QUEUED\",\"prn\":\"" + escapeJson(prn) + "\",\"type\":\"" + type + "\"}");
-
-                } else if ("PREVIEW".equals(cmd)) {
-                    // 预览(不打印)
-                    String prn = jsonGet(cmdJson, "prn");
-                    int jsonEnd = Integer.parseInt(parsed[1]);
-                    byte[] payload = new byte[len - jsonEnd];
-                    System.arraycopy(buf, jsonEnd, payload, 0, payload.length);
-
-                    PrintType type = detectType(payload);
-                    log("PREVIEW type=" + type + " size=" + payload.length);
-                    sendJson(socket, addr, rport, "{\"status\":\"PREVIEW\",\"type\":\"" + type + "\"}");
-                    showPreview(payload, type);
 
                 } else {
                     sendJson(socket, addr, rport, "{\"status\":\"FAIL\",\"msg\":\"unknown cmd: " + escapeJson(String.valueOf(cmd)) + "\"}");
