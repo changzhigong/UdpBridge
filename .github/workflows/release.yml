@@ -27,16 +27,16 @@ jobs:
         shell: cmd
         run: |
           cd installer
-          javac --release 17 -encoding UTF-8 -d . ..\LodopUdpBridge.java
-          jar cfe LodopUdpBridge.jar LodopUdpBridge LodopUdpBridge.class LodopUdpBridge$1.class LodopUdpBridge$2.class LodopUdpBridge$3.class
+          javac --release 17 -encoding UTF-8 -d lodop ..\LodopUdpBridge.java
+          jar cfe LodopUdpBridge.jar LodopUdpBridge -C lodop .
           dir LodopUdpBridge.jar
 
       - name: Compile UniversalPrintBridge JAR
         shell: cmd
         run: |
-          javac -cp "lib/pdfbox-2.0.30.jar;lib/fontbox-2.0.30.jar;lib/commons-logging-1.2.jar" --release 17 -encoding UTF-8 -d installer UniversalPrintBridge.java
+          javac -cp "lib/pdfbox-2.0.30.jar;lib/fontbox-2.0.30.jar;lib/commons-logging-1.2.jar" --release 17 -encoding UTF-8 -d installer\univ UniversalPrintBridge.java
           cd installer
-          jar cfe UniversalPrintBridge.jar UniversalPrintBridge UniversalPrintBridge.class UniversalPrintBridge$PrintQueue.class UniversalPrintBridge$PrintTask.class UniversalPrintBridge$PrintType.class UniversalPrintBridge$1.class
+          jar cfe UniversalPrintBridge.jar UniversalPrintBridge -C univ .
           dir UniversalPrintBridge.jar
           mkdir lib 2>nul
           copy ..\lib\pdfbox-2.0.30.jar lib\
