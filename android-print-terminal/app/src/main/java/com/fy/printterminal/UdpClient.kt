@@ -88,8 +88,10 @@ object UdpClient {
         type: String,
         printer: String,
         data: ByteArray,
-        copies: Int = 1
-    ): PrintResult = printRaw(gatewayIp, type, printer, data, copies)
+        copies: Int = 1,
+        paper: String = "",
+        orientation: String = ""
+    ): PrintResult = printRaw(gatewayIp, type, printer, data, copies, paper, orientation)
 
     /**
      * 发送打印任务 (分片 UDP 传输, 支持大文件)
@@ -103,7 +105,9 @@ object UdpClient {
         type: String,
         printer: String,
         data: ByteArray,
-        copies: Int = 1
+        copies: Int = 1,
+        paper: String = "",
+        orientation: String = ""
     ): PrintResult = withContext(Dispatchers.IO) {
         if (data.isEmpty()) return@withContext PrintResult("FAIL", "empty data")
 
@@ -117,6 +121,8 @@ object UdpClient {
                 append("\"prn\":\"${escapeJson(printer)}\",")
                 append("\"type\":\"$type\",")
                 append("\"copies\":$copies,")
+                append("\"paper\":\"${escapeJson(paper)}\",")
+                append("\"orientation\":\"${escapeJson(orientation)}\",")
                 append("\"chunks\":$total,")
                 append("\"size\":${data.size}")
                 append("}")
@@ -301,11 +307,13 @@ object UdpClient {
         gatewayIp: String,
         printer: String,
         bitmap: Bitmap,
-        copies: Int = 1
+        copies: Int = 1,
+        paper: String = "",
+        orientation: String = ""
     ): PrintResult {
         val stream = ByteArrayOutputStream()
         bitmap.compress(Bitmap.CompressFormat.PNG, 100, stream)
-        return printBase64(gatewayIp, "IMAGE", printer, stream.toByteArray(), copies)
+        return printBase64(gatewayIp, "IMAGE", printer, stream.toByteArray(), copies, paper, orientation)
     }
 
     /**
@@ -315,9 +323,11 @@ object UdpClient {
         gatewayIp: String,
         printer: String,
         pdfBytes: ByteArray,
-        copies: Int = 1
+        copies: Int = 1,
+        paper: String = "",
+        orientation: String = ""
     ): PrintResult {
-        return printBase64(gatewayIp, "PDF", printer, pdfBytes, copies)
+        return printBase64(gatewayIp, "PDF", printer, pdfBytes, copies, paper, orientation)
     }
 
     /**
@@ -327,9 +337,11 @@ object UdpClient {
         gatewayIp: String,
         printer: String,
         text: String,
-        copies: Int = 1
+        copies: Int = 1,
+        paper: String = "",
+        orientation: String = ""
     ): PrintResult {
-        return printBase64(gatewayIp, "TEXT", printer, text.toByteArray(Charsets.UTF_8), copies)
+        return printBase64(gatewayIp, "TEXT", printer, text.toByteArray(Charsets.UTF_8), copies, paper, orientation)
     }
 
     // ---- 底层 UDP 发送 ----

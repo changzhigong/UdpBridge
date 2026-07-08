@@ -38,7 +38,8 @@ import javax.swing.*;
 
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.printing.PDFPrintable;
-import org.apache.pdfbox.printing.Orientation;
+import org.apache.pdfbox.printing.Scaling;
+import org.apache.pdfbox.pdmodel.common.PDRectangle;
 import org.apache.pdfbox.rendering.PDFRenderer;
 import org.apache.pdfbox.rendering.ImageType;
 
@@ -66,6 +67,7 @@ public class UniversalPrintBridge {
         DatagramSocket socket;
         InetAddress addr;
         int port;
+        String paper, orientation;
 
         PrintTask(String printer, byte[] data, int copies) {
             this.printer = printer; this.data = data; this.copies = copies;
@@ -136,9 +138,11 @@ public class UniversalPrintBridge {
                 if (ps == null) { logErr("未找到打印机: " + task.printer); return false; }
                 job.setPrintService(ps);
 
-                PDFPrintable printable = new PDFPrintable(doc);
+                PageFormat pf = buildPageFormat(doc, task.paper, task.orientation);
+                if (pf == null) pf = job.defaultPage();
+                PDFPrintable printable = new PDFPrintable(doc, Scaling.SCALE_TO_FIT);
                 Book book = new Book();
-                book.append(printable, job.defaultPage(), doc.getNumberOfPages());
+                book.append(printable, pf, doc.getNumberOfPages());
 
                 if (task.copies > 1) job.setCopies(task.copies);
                 job.setPageable(book);
@@ -147,6 +151,41 @@ public class UniversalPrintBridge {
             } finally {
                 doc.close();
             }
+        }
+
+        // 构建打印页面格式：用户指定优先，否则按文档第一页真实尺寸/方向
+        static PageFormat buildPageFormat(PDDocument doc, String paperArg, String orientArg) {
+            double wPt, hPt;
+            boolean landscape;
+            if (paperArg != null && !paperArg.isEmpty()) {
+                switch (paperArg.toUpperCase()) {
+                    case "A3":     wPt = 842; hPt = 1191; break;
+                    case "A5":     wPt = 420; hPt = 595;  break;
+                    case "B5":     wPt = 499; hPt = 709;  break;
+                    case "LETTER": wPt = 612; hPt = 792;  break;
+                    case "A4":
+                    default:       wPt = 595; hPt = 842;  break;
+                }
+                landscape = "LANDSCAPE".equalsIgnoreCase(orientArg);
+            } else if (doc != null) {
+                try {
+                    PDRectangle mb = doc.getPage(0).getMediaBox();
+                    wPt = mb.getWidth(); hPt = mb.getHeight();
+                } catch (Exception e) { wPt = 595; hPt = 842; }
+                landscape = wPt > hPt;
+                if (orientArg != null && !orientArg.isEmpty())
+                    landscape = "LANDSCAPE".equalsIgnoreCase(orientArg);
+            } else {
+                return null;
+            }
+            double longSide = Math.max(wPt, hPt);
+            double shortSide = Math.min(wPt, hPt);
+            Paper paper = new Paper();
+            paper.setSize(longSide, shortSide); // 单位 1/72 inch = pt
+            PageFormat pf = new PageFormat();
+            pf.setPaper(paper);
+            pf.setOrientation(landscape ? PageFormat.LANDSCAPE : PageFormat.PORTRAIT);
+            return pf;
         }
 
         // ---- 图片打印 ----
@@ -159,20 +198,22 @@ public class UniversalPrintBridge {
             if (ps == null) { logErr("未找到打印机: " + task.printer); return false; }
             job.setPrintService(ps);
 
+            PageFormat pf = buildPageFormat(null, task.paper, task.orientation);
+            if (pf == null) pf = job.defaultPage();
             BufferedImage finalImg = img;
-            job.setPrintable((g, pf, page) -> {
+            job.setPrintable((g, p, page) -> {
                 if (page > 0) return Printable.NO_SUCH_PAGE;
                 double scale = Math.min(
-                    (double)pf.getImageableWidth() / finalImg.getWidth(),
-                    (double)pf.getImageableHeight() / finalImg.getHeight()
+                    (double)p.getImageableWidth() / finalImg.getWidth(),
+                    (double)p.getImageableHeight() / finalImg.getHeight()
                 );
                 int w = (int)(finalImg.getWidth() * scale);
                 int h = (int)(finalImg.getHeight() * scale);
                 Graphics2D g2 = (Graphics2D)g;
-                g2.translate(pf.getImageableX(), pf.getImageableY());
+                g2.translate(p.getImageableX(), p.getImageableY());
                 g2.drawImage(finalImg, 0, 0, w, h, null);
                 return Printable.PAGE_EXISTS;
-            });
+            }, pf);
 
             if (task.copies > 1) job.setCopies(task.copies);
             job.print();
@@ -229,6 +270,7 @@ public class UniversalPrintBridge {
         long start = System.currentTimeMillis();
         int rounds = 0;
         boolean done = false;
+        String paper, orientation;
     }
 
     static String key(InetAddress a, int p) { return a.getHostAddress() + ":" + p; }
@@ -277,18 +319,19 @@ public class UniversalPrintBridge {
         byte[] payload = a.buffer;
         log("分片组装完成 mode=" + a.mode + " prn=" + a.printer + " size=" + payload.length);
         if (a.mode == Mode.PRINT) {
-            queuePrint(a.printer, payload, a.copies, a.socket, a.addr, a.port);
+            queuePrint(a.printer, payload, a.copies, a.paper, a.orientation, a.socket, a.addr, a.port);
         } else {
             doPreview(payload, a.socket, a.addr, a.port);
         }
         assemblies.remove(key(a.addr, a.port));
     }
 
-    static void queuePrint(String prn, byte[] payload, int copies,
+    static void queuePrint(String prn, byte[] payload, int copies, String paper, String orientation,
                            DatagramSocket socket, InetAddress addr, int port) {
-        log("PRINT prn=" + prn + " size=" + payload.length + " copies=" + copies);
+        log("PRINT prn=" + prn + " size=" + payload.length + " copies=" + copies + " paper=" + paper + " orient=" + orientation);
         PrintTask task = new PrintTask(prn, payload, copies);
         task.socket = socket; task.addr = addr; task.port = port;
+        task.paper = paper; task.orientation = orientation;
         PrintQueue.INSTANCE.submit(task);
         try {
             sendJson(socket, addr, port,
@@ -330,6 +373,21 @@ public class UniversalPrintBridge {
     static String findOfficeExe() {
         String env = System.getenv("OFFICE_CONVERTER");
         if (env != null && !env.isEmpty() && new File(env).exists()) return env;
+
+        // 优先检测随安装包分发的 LibreOffice（位于 jar 同目录的 LibreOffice/program）
+        try {
+            java.net.URI uri = UniversalPrintBridge.class.getProtectionDomain()
+                .getCodeSource().getLocation().toURI();
+            String jarDir = new File(uri).getParent();
+            for (String rel : new String[]{
+                "LibreOffice\\program\\soffice.exe",
+                "LibreOffice/program/soffice.exe",
+                "LibreOffice/program/soffice"
+            }) {
+                File f = new File(jarDir, rel);
+                if (f.exists()) return f.getAbsolutePath();
+            }
+        } catch (Exception e) { /* 回退到系统路径 */ }
 
         String[] candidates = {
             "C:\\Program Files\\LibreOffice\\program\\soffice.exe",
@@ -854,6 +912,8 @@ public class UniversalPrintBridge {
                         Assembly a = new Assembly();
                         a.mode = "PREVIEW".equals(cmd) ? Mode.PREVIEW : Mode.PRINT;
                         a.printer = prn; a.copies = copies;
+                        a.paper = jsonGet(cmdJson, "paper");
+                        a.orientation = jsonGet(cmdJson, "orientation");
                         a.size = size; a.total = total;
                         a.buffer = new byte[size];
                         a.addr = addr; a.port = rport; a.socket = socket;

@@ -4,8 +4,10 @@ import android.graphics.BitmapFactory
 import android.os.Bundle
 import android.view.ViewGroup
 import android.widget.Button
+import android.widget.ArrayAdapter
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
@@ -39,6 +41,19 @@ class PrintPreviewActivity : AppCompatActivity() {
         val container = findViewById<LinearLayout>(R.id.previewContainer)
         val btnPrintNow = findViewById<Button>(R.id.btnPrintNow)
 
+        val spinnerPaper = findViewById<Spinner>(R.id.spinnerPaper)
+        val spinnerOrientation = findViewById<Spinner>(R.id.spinnerOrientation)
+        spinnerPaper.adapter = ArrayAdapter(this,
+            android.R.layout.simple_spinner_item,
+            arrayOf("自动", "A3", "A4", "A5", "B5", "Letter")).apply {
+            setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        }
+        spinnerOrientation.adapter = ArrayAdapter(this,
+            android.R.layout.simple_spinner_item,
+            arrayOf("自动", "纵向", "横向")).apply {
+            setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        }
+
         tvTitle.text = "打印预览 ($type) → $printer"
 
         if (bytes == null || bytes.isEmpty()) {
@@ -65,9 +80,11 @@ class PrintPreviewActivity : AppCompatActivity() {
             btnPrintNow.text = "打印中…"
             scope.launch {
                 try {
-                    val result = withContext(Dispatchers.IO) {
-                        UdpClient.printRaw(gatewayIp, type, printer, bytes)
-                    }
+                val result = withContext(Dispatchers.IO) {
+                    val paper = if (spinnerPaper.selectedItem.toString() == "自动") "" else spinnerPaper.selectedItem.toString()
+                    val orient = if (spinnerOrientation.selectedItem.toString() == "自动") "" else spinnerOrientation.selectedItem.toString()
+                    UdpClient.printRaw(gatewayIp, type, printer, bytes, 1, paper, orient)
+                }
                     if (result.status == "QUEUED" || result.status == "DONE") {
                         Toast.makeText(this@PrintPreviewActivity, "打印任务已提交", Toast.LENGTH_SHORT).show()
                         finish()

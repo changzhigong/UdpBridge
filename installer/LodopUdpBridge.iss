@@ -3,7 +3,7 @@
 
 [Setup]
 AppName=打印网关
-AppVersion=1.5.0
+AppVersion=1.5.1
 AppPublisher=郑州晖锦
 DefaultDirName={autopf}\打印网关
 DefaultGroupName=打印网关
@@ -30,6 +30,7 @@ Source: launch.vbs; DestDir: {app}; Flags: ignoreversion
 Source: run.bat; DestDir: {app}; Flags: ignoreversion
 Source: run_universal.bat; DestDir: {app}; Flags: ignoreversion
 Source: jre\*; DestDir: {app}\jre; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: LibreOffice\*; DestDir: {app}\LibreOffice; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: {group}\启动打印网关; Filename: {app}\launch.vbs; WorkingDir: {app}; IconFilename: {app}\launch.vbs

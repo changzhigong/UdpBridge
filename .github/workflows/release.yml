@@ -51,6 +51,21 @@ jobs:
           jlink --add-modules java.base,java.datatransfer,java.xml,java.prefs,java.desktop,java.logging,java.net.http --output jre --strip-debug --no-header-files --no-man-pages --compress=2
           dir jre\bin\javaw.exe
 
+      - name: Bundle LibreOffice (portable, for Office→PDF conversion)
+        shell: powershell
+        run: |
+          $ver = "26.2.4"
+          $url = "https://download.documentfoundation.org/libreoffice/stable/$ver/win/x86_64/LibreOffice_${ver}_Win_x86-64.msi"
+          $msi = "installer\LibreOffice.msi"
+          Write-Host "Downloading LibreOffice $ver ..."
+          Invoke-WebRequest -Uri $url -OutFile $msi
+          $target = Join-Path $PWD "installer\LibreOffice"
+          Write-Host "Extracting via msiexec /a to $target ..."
+          $p = Start-Process msiexec.exe -ArgumentList "/a","$msi","TARGETDIR=$target","/qn" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "msiexec /a failed: $($p.ExitCode)" }
+          Remove-Item $msi -Force
+          if (Test-Path "$target\program\soffice.exe") { Write-Host "LibreOffice bundled OK" } else { throw "soffice.exe not found after extraction" }
+
       - name: Compile Inno Setup
         shell: powershell
         run: |

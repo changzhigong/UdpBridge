@@ -13,6 +13,9 @@
 installer/jre/
 dist-bridge/runtime/
 
+# === LibreOffice 随包分发（本地复制进 installer，体积大，不入库）===
+installer/LibreOffice/
+
 # === 安装包输出 ===
 installer-output/
 dist-bridge/LodopUdpBridge_Setup.exe
