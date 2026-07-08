@@ -20,6 +20,7 @@ object UdpClient {
     private const val BROADCAST_TIMEOUT = 3000
     private const val MAX_BUFFER = 65507
     private const val CHUNK_SIZE = 8000
+    private const val PREVIEW_CHUNK_SIZE = 6000
 
     /**
      * 网关发现结果
@@ -168,12 +169,129 @@ object UdpClient {
         val end = minOf(start + CHUNK_SIZE, data.size)
         val chunk = data.copyOfRange(start, end)
         val json = """{"cmd":"CHUNK","seq":$seq,"total":$total}"""
-        val jsonBytes = json.toByteArray(Charsets.UTF_8)
-        val pkt = ByteArray(jsonBytes.size + chunk.size)
-        System.arraycopy(jsonBytes, 0, pkt, 0, jsonBytes.size)
-        System.arraycopy(chunk, 0, pkt, jsonBytes.size, chunk.size)
+        val jb = json.toByteArray(Charsets.UTF_8)
+        val jl = jb.size
+        // 长度前缀帧: [4字节大端JSON长度][JSON][二进制]
+        val pkt = ByteArray(4 + jl + chunk.size)
+        pkt[0] = ((jl ushr 24) and 0xFF).toByte()
+        pkt[1] = ((jl ushr 16) and 0xFF).toByte()
+        pkt[2] = ((jl ushr 8) and 0xFF).toByte()
+        pkt[3] = (jl and 0xFF).toByte()
+        System.arraycopy(jb, 0, pkt, 4, jl)
+        System.arraycopy(chunk, 0, pkt, 4 + jl, chunk.size)
         socket.send(DatagramPacket(pkt, pkt.size, addr, UDP_PORT))
     }
+
+    /**
+     * 请求预览: 上传文件到 PC 网关, PC 将内容渲染为每页 PNG 并分片回传
+     * @return 每页 PNG 图片字节列表(顺序)
+     */
+    suspend fun requestPreview(
+        gatewayIp: String,
+        type: String,
+        printer: String,
+        data: ByteArray
+    ): List<ByteArray> = withContext(Dispatchers.IO) {
+        if (data.isEmpty()) return@withContext emptyList()
+
+        val socket = DatagramSocket().apply { soTimeout = 3000 }
+        try {
+            val addr = InetAddress.getByName(gatewayIp)
+            val total = (data.size + CHUNK_SIZE - 1) / CHUNK_SIZE
+            val header = buildString {
+                append("{")
+                append("\"cmd\":\"PREVIEW\",")
+                append("\"prn\":\"${escapeJson(printer)}\",")
+                append("\"type\":\"$type\",")
+                append("\"copies\":1,")
+                append("\"chunks\":$total,")
+                append("\"size\":${data.size}")
+                append("}")
+            }
+            socket.send(DatagramPacket(header.toByteArray(Charsets.UTF_8), header.length, addr, UDP_PORT))
+            sendAllChunks(socket, addr, data, total)
+
+            val buf = ByteArray(MAX_BUFFER)
+            var pages = 0
+            var blobSize = 0
+            var ptotal = 0
+            val chunks = mutableMapOf<Int, ByteArray>()
+            var gotReady = false
+            var retries = 0
+            while (retries < 12) {
+                try {
+                    val packet = DatagramPacket(buf, buf.size)
+                    socket.receive(packet)
+                    val resp = String(packet.data, 0, packet.length, Charsets.UTF_8)
+                    when {
+                        resp.contains("PREVIEW_READY") -> {
+                            pages = jsonGetInt(resp, "pages")
+                            blobSize = jsonGetInt(resp, "size")
+                            ptotal = (blobSize + PREVIEW_CHUNK_SIZE - 1) / PREVIEW_CHUNK_SIZE
+                            if (ptotal == 0) ptotal = 1
+                            gotReady = true
+                        }
+                        resp.contains("PREVIEW_CHUNK") -> {
+                            val seq = jsonGetInt(resp, "seq")
+                            val jsonLen = readIntBE(packet.data, 0)
+                            val jsonEnd = 4 + jsonLen
+                            val bin = packet.data.copyOfRange(jsonEnd, packet.length)
+                            chunks[seq] = bin
+                        }
+                        resp.contains("PREVIEW_FAIL") ->
+                            throw IOException("预览失败: " + (jsonGet(resp, "msg") ?: ""))
+                        resp.contains("READY") -> { sendAllChunks(socket, addr, data, total); retries++ }
+                        resp.contains("MISSING") -> {
+                            val seqs = jsonGet(resp, "seqs")?.split(",")
+                                ?.mapNotNull { it.toIntOrNull() } ?: emptyList()
+                            sendChunks(socket, addr, data, seqs)
+                            retries++
+                        }
+                    }
+                    if (gotReady && chunks.size >= ptotal) break
+                } catch (e: SocketTimeoutException) {
+                    if (gotReady) {
+                        val missing = (0 until ptotal).filter { !chunks.containsKey(it) }
+                        if (missing.isEmpty()) break
+                        val req = """{"cmd":"PREVIEW_MISSING","seqs":"${missing.joinToString(",")}"}"""
+                        socket.send(DatagramPacket(req.toByteArray(Charsets.UTF_8), req.length, addr, UDP_PORT))
+                        retries++
+                    } else {
+                        sendAllChunks(socket, addr, data, total)
+                        retries++
+                    }
+                }
+            }
+            if (!gotReady) return@withContext emptyList()
+
+            // 重组 blob
+            val blob = ByteArrayOutputStream()
+            for (i in 0 until ptotal) {
+                val c = chunks[i] ?: return@withContext emptyList()
+                blob.write(c)
+            }
+            val blobBytes = blob.toByteArray()
+            // 解析每页: [4字节大端长度][PNG]
+            val pagesOut = mutableListOf<ByteArray>()
+            var off = 0
+            while (off + 4 <= blobBytes.size) {
+                val len = readIntBE(blobBytes, off)
+                off += 4
+                if (off + len > blobBytes.size) break
+                pagesOut.add(blobBytes.copyOfRange(off, off + len))
+                off += len
+            }
+            pagesOut
+        } finally {
+            socket.close()
+        }
+    }
+
+    private fun readIntBE(b: ByteArray, off: Int): Int =
+        ((b[off].toInt() and 0xFF) shl 24) or
+        ((b[off + 1].toInt() and 0xFF) shl 16) or
+        ((b[off + 2].toInt() and 0xFF) shl 8) or
+        (b[off + 3].toInt() and 0xFF)
 
     /**
      * 从 Bitmap 打印图片 (一行代码打印)

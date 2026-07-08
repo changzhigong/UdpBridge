@@ -102,6 +102,13 @@ class MainActivity : AppCompatActivity() {
             type = "*/*"
             putExtra(Intent.EXTRA_MIME_TYPES, arrayOf(
                 "application/pdf",
+                "application/msword",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "application/vnd.ms-excel",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "application/vnd.ms-powerpoint",
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                "application/rtf",
                 "image/png",
                 "image/jpeg",
                 "image/bmp",
@@ -140,6 +147,18 @@ class MainActivity : AppCompatActivity() {
                 return "IMAGE"
             if (data[0] == 0xFF.toByte() && data[1] == 0xD8.toByte())
                 return "IMAGE"
+            // Office / 压缩包(PK = docx/xlsx/pptx 均为 zip)
+            if (data[0] == 'P'.toByte() && data[1] == 'K'.toByte()
+                && data[2] == 0x03.toByte() && data[3] == 0x04.toByte())
+                return "OFFICE"
+            // 旧版 Office OLE 复合文档(doc/xls/ppt)
+            if (data[0] == 0xD0.toByte() && data[1] == 0xCF.toByte()
+                && data[2] == 0x11.toByte() && data[3] == 0xE0.toByte())
+                return "OFFICE"
+            // RTF
+            if (data[0] == '{'.toByte() && data[1] == '\\'.toByte()
+                && data[2] == 'r'.toByte() && data[3] == 't'.toByte())
+                return "OFFICE"
         }
         // 尝试作为文本
         return try {
@@ -147,9 +166,9 @@ class MainActivity : AppCompatActivity() {
             if (text.all { it.isISOControl() || it.isLetterOrDigit() || it.isWhitespace() || it in ".,;:!?()[]{}-_+=@#$%^&*<>|/\\\"'" })
                 "TEXT"
             else
-                "BINARY"
+                "OFFICE"
         } catch (e: Exception) {
-            "BINARY"
+            "OFFICE"
         }
     }
 
@@ -161,14 +180,21 @@ class MainActivity : AppCompatActivity() {
         }
         val type = currentFileType ?: "UNKNOWN"
         val printer = selectedPrinter ?: ""
+        val ip = gatewayIp ?: run {
+            Toast.makeText(this, "请先扫描网关", Toast.LENGTH_SHORT).show()
+            return
+        }
 
         val intent = Intent(this, PrintPreviewActivity::class.java).apply {
             putExtra("file_type", type)
             putExtra("printer", printer)
+            putExtra("gateway_ip", ip)
         }
-        // 图片数据通过临时缓存传递; PDF/TEXT 也类似
+        // 数据通过临时缓存传递(避免 Intent 体积限制)
         PreviewCache.data = bytes
         PreviewCache.type = type
+        PreviewCache.printer = printer
+        PreviewCache.gatewayIp = ip
         startActivity(intent)
     }
 
@@ -280,4 +306,6 @@ class MainActivity : AppCompatActivity() {
 object PreviewCache {
     var data: ByteArray? = null
     var type: String = ""
+    var printer: String = ""
+    var gatewayIp: String = ""
 }
