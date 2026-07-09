@@ -166,7 +166,7 @@ public class UniversalPrintBridge {
                     case "A4":
                     default:       wPt = 595; hPt = 842;  break;
                 }
-                landscape = "LANDSCAPE".equalsIgnoreCase(orientArg);
+                landscape = isLandscape(orientArg);
             } else if (doc != null) {
                 try {
                     PDRectangle mb = doc.getPage(0).getMediaBox();
@@ -174,18 +174,29 @@ public class UniversalPrintBridge {
                 } catch (Exception e) { wPt = 595; hPt = 842; }
                 landscape = wPt > hPt;
                 if (orientArg != null && !orientArg.isEmpty())
-                    landscape = "LANDSCAPE".equalsIgnoreCase(orientArg);
+                    landscape = isLandscape(orientArg);
             } else {
                 return null;
             }
             double longSide = Math.max(wPt, hPt);
             double shortSide = Math.min(wPt, hPt);
+            // 物理纸张尺寸必须按方向设置: 横向=长边为宽, 纵向=长边为高。
+            // 否则纵向文档被塞进横向纸, SCALE_TO_FIT 后左右大片留白, 无法铺满页面。
+            double pw = landscape ? longSide : shortSide;
+            double ph = landscape ? shortSide : longSide;
             Paper paper = new Paper();
-            paper.setSize(longSide, shortSide); // 单位 1/72 inch = pt
+            paper.setSize(pw, ph);                  // 单位 1/72 inch = pt
+            paper.setImageableArea(0, 0, pw, ph);   // 用满整张纸(硬件边距由打印机驱动裁剪)
             PageFormat pf = new PageFormat();
             pf.setPaper(paper);
             pf.setOrientation(landscape ? PageFormat.LANDSCAPE : PageFormat.PORTRAIT);
             return pf;
+        }
+
+        // 方向判定: 支持英文 LANDSCAPE/PORTRAIT 与中文 横向/纵向
+        static boolean isLandscape(String orientArg) {
+            if (orientArg == null) return false;
+            return orientArg.equalsIgnoreCase("LANDSCAPE") || orientArg.equals("横向");
         }
 
         // ---- 图片打印 ----

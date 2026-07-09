@@ -127,7 +127,8 @@ object UdpClient {
                 append("\"size\":${data.size}")
                 append("}")
             }
-            socket.send(DatagramPacket(header.toByteArray(Charsets.UTF_8), header.length, addr, UDP_PORT))
+            val headerBytes = header.toByteArray(Charsets.UTF_8)
+            socket.send(DatagramPacket(headerBytes, headerBytes.size, addr, UDP_PORT))
 
             val buf = ByteArray(4096)
             var result: PrintResult? = null
@@ -215,7 +216,7 @@ object UdpClient {
                 append("\"size\":${data.size}")
                 append("}")
             }
-            socket.send(DatagramPacket(header.toByteArray(Charsets.UTF_8), header.length, addr, UDP_PORT))
+            socket.send(DatagramPacket(header.toByteArray(Charsets.UTF_8), header.toByteArray(Charsets.UTF_8).size, addr, UDP_PORT))
             sendAllChunks(socket, addr, data, total)
 
             val buf = ByteArray(MAX_BUFFER)
