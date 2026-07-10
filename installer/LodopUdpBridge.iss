@@ -3,7 +3,7 @@
 
 [Setup]
 AppName=打印网关
-AppVersion=1.5.2
+AppVersion=1.6.0
 AppPublisher=郑州晖锦
 DefaultDirName={autopf}\打印网关
 DefaultGroupName=打印网关
@@ -42,7 +42,10 @@ Name: {autodesktop}\启动打印网关; Filename: {app}\launch.vbs; WorkingDir: 
 Root: HKCU; Subkey: Software\Microsoft\Windows\CurrentVersion\Run; ValueType: string; ValueName: 打印网关; ValueData: """{app}\launch.vbs"""; Flags: uninsdeletevalue; Tasks: autostart
 
 [Run]
-Filename: {app}\launch.vbs; Description: 启动打印网关（CLODOP 51010 + 通用 52010）; Flags: nowait postinstall runascurrentuser shellexec
+; 放行防火墙: UDP 52010(局域网发现广播) + TCP 52011(打印上传/预览回传数据面)
+Filename: {sys}\netsh.exe; Parameters: "advfirewall firewall add rule name=""打印网关-UDP"" dir=in action=allow protocol=UDP localport=52010"; Flags: runhidden skiperror
+Filename: {sys}\netsh.exe; Parameters: "advfirewall firewall add rule name=""打印网关-TCP"" dir=in action=allow protocol=TCP localport=52011"; Flags: runhidden skiperror
+Filename: {app}\launch.vbs; Description: 启动打印网关（UDP 52010 发现 + TCP 52011 数据）; Flags: nowait postinstall runascurrentuser shellexec
 
 [Code]
 // 卸载完成后确认是否删除配置数据和日志文件

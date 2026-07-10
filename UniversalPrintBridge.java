@@ -47,7 +47,9 @@ public class UniversalPrintBridge {
     static final int UDP_PORT = 52010;
     static final int MAX_PACKET = 65507;
     static final int CHUNK_SIZE = 8000;          // 安卓→PC 上传分片
-    static final int PREVIEW_CHUNK_SIZE = 6000;  // PC→安卓 预览回传分片
+    static final int PREVIEW_CHUNK_SIZE = 6000;  // PC→安卓 预览回传分片(旧版UDP兼容)
+    static final int TCP_PORT = 52011;           // 数据面: 打印文件上传 + 预览回传(TCP 可靠传输)
+    static final int TCP_TIMEOUT = 30000;        // TCP 每连接读写超时(ms)
     static final int MAX_RETRY = 3;
     static final String LOG_DIR = System.getenv("APPDATA") + "\\LodopUdpBridge";
     static PrintWriter log;
@@ -68,6 +70,7 @@ public class UniversalPrintBridge {
         InetAddress addr;
         int port;
         String paper, orientation;
+        java.util.concurrent.CompletableFuture<String> future = new java.util.concurrent.CompletableFuture<>();
 
         PrintTask(String printer, byte[] data, int copies) {
             this.printer = printer; this.data = data; this.copies = copies;
@@ -250,12 +253,17 @@ public class UniversalPrintBridge {
 
         // ---- 发送 ACK ----
         void sendAck(PrintTask task, String status, String msg) {
-            try {
-                String json = "{\"status\":\"" + status + "\",\"msg\":\"" + escapeJson(msg) + "\"}";
-                byte[] b = json.getBytes(StandardCharsets.UTF_8);
-                DatagramPacket pkt = new DatagramPacket(b, b.length, task.addr, task.port);
-                task.socket.send(pkt);
-            } catch (Exception e) { /* best effort */ }
+            String json = "{\"status\":\"" + status + "\",\"msg\":\"" + escapeJson(msg) + "\"}";
+            // TCP 数据面: 通知等待结果的连接线程
+            if (task.future != null && !task.future.isDone()) task.future.complete(json);
+            // UDP 旧版兼容: 通过原 socket 回发 ACK
+            if (task.socket != null) {
+                try {
+                    byte[] b = json.getBytes(StandardCharsets.UTF_8);
+                    DatagramPacket pkt = new DatagramPacket(b, b.length, task.addr, task.port);
+                    task.socket.send(pkt);
+                } catch (Exception e) { /* best effort */ }
+            }
         }
     }
 
@@ -337,17 +345,37 @@ public class UniversalPrintBridge {
         assemblies.remove(key(a.addr, a.port));
     }
 
-    static void queuePrint(String prn, byte[] payload, int copies, String paper, String orientation,
-                           DatagramSocket socket, InetAddress addr, int port) {
+    // 提交打印任务到单线程队列(打印/预览共用, 保证打印机独占串行)
+    static PrintTask submitPrintTask(String prn, byte[] payload, int copies, String paper, String orientation) {
         log("PRINT prn=" + prn + " size=" + payload.length + " copies=" + copies + " paper=" + paper + " orient=" + orientation);
         PrintTask task = new PrintTask(prn, payload, copies);
-        task.socket = socket; task.addr = addr; task.port = port;
         task.paper = paper; task.orientation = orientation;
         PrintQueue.INSTANCE.submit(task);
+        return task;
+    }
+
+    // UDP 旧版兼容: 提交后通过 UDP socket 回 QUEUED(已升级安卓端不再走此路径)
+    @SuppressWarnings("deprecation")
+    static void queuePrint(String prn, byte[] payload, int copies, String paper, String orientation,
+                           DatagramSocket socket, InetAddress addr, int port) {
+        PrintTask task = submitPrintTask(prn, payload, copies, paper, orientation);
+        task.socket = socket; task.addr = addr; task.port = port;
         try {
             sendJson(socket, addr, port,
                 "{\"status\":\"QUEUED\",\"prn\":\"" + escapeJson(prn) + "\",\"type\":\"" + detectContentType(payload) + "\"}");
         } catch (Exception e) { /* best effort */ }
+    }
+
+    // TCP 数据面: 提交打印并阻塞等待结果(单连接单命令)
+    static String queuePrintTcp(String prn, byte[] payload, int copies, String paper, String orientation) {
+        PrintTask task = submitPrintTask(prn, payload, copies, paper, orientation);
+        try {
+            return task.future.get(TCP_TIMEOUT, java.util.concurrent.TimeUnit.MILLISECONDS);
+        } catch (java.util.concurrent.TimeoutException te) {
+            return "{\"status\":\"FAIL\",\"msg\":\"print timeout\"}";
+        } catch (Exception e) {
+            return "{\"status\":\"FAIL\",\"msg\":\"print error: " + escapeJson(String.valueOf(e.getMessage())) + "\"}";
+        }
     }
 
     // ==================== 内容类型检测 ====================
@@ -527,7 +555,118 @@ public class UniversalPrintBridge {
             byte[] pkt = buildPrefixed(json, chunk);
             s.socket.send(new DatagramPacket(pkt, pkt.length, s.addr, s.port));
             s.received.add(seq);
-            Thread.sleep(2); // 避免接收端 UDP 缓冲溢出丢包
+            Thread.sleep(2); // 避免接收端 UDP 缓冲溢出丢包(旧版UDP兼容)
+        }
+    }
+
+    // ==================== TCP 数据面(打印上传 + 预览回传, 替代 UDP 分片) ====================
+    // 帧格式: [4字节大端二进制长度 bl][4字节大端JSON长度 jl][JSON(jl字节)][二进制(bl字节)]
+    // 单连接单命令: 安卓端建连 -> 发一帧 -> PC 处理 -> 回一帧 -> 关连接
+
+    static void writeTcpFrame(OutputStream out, String json, byte[] binary) throws IOException {
+        byte[] jb = json.getBytes(StandardCharsets.UTF_8);
+        int bl = (binary != null) ? binary.length : 0;
+        int jl = jb.length;
+        out.write((bl >>> 24) & 0xFF); out.write((bl >>> 16) & 0xFF);
+        out.write((bl >>> 8) & 0xFF); out.write(bl & 0xFF);
+        out.write((jl >>> 24) & 0xFF); out.write((jl >>> 16) & 0xFF);
+        out.write((jl >>> 8) & 0xFF); out.write(jl & 0xFF);
+        out.write(jb);
+        if (binary != null) out.write(binary);
+        out.flush();
+    }
+
+    static byte[][] readTcpFrame(InputStream in) throws IOException {
+        int bl = readIntBE(in);
+        int jl = readIntBE(in);
+        if (jl < 0 || jl > 10_000_000) throw new IOException("bad json length " + jl);
+        if (bl < 0 || bl > 200_000_000) throw new IOException("bad binary length " + bl);
+        byte[] jb = new byte[jl];
+        readFully(in, jb, jl);
+        byte[] bin = new byte[0];
+        if (bl > 0) { bin = new byte[bl]; readFully(in, bin, bl); }
+        return new byte[][]{ jb, bin };
+    }
+
+    static void readFully(InputStream in, byte[] buf, int n) throws IOException {
+        int off = 0;
+        while (off < n) {
+            int r = in.read(buf, off, n - off);
+            if (r < 0) throw new IOException("stream closed");
+            off += r;
+        }
+    }
+
+    static int readIntBE(InputStream in) throws IOException {
+        byte[] b = new byte[4];
+        readFully(in, b, 4);
+        return ((b[0] & 0xFF) << 24) | ((b[1] & 0xFF) << 16) | ((b[2] & 0xFF) << 8) | (b[3] & 0xFF);
+    }
+
+    static void startTcpServer() {
+        try {
+            ServerSocket server = new ServerSocket(TCP_PORT);
+            log("TCP 数据服务监听端口 " + TCP_PORT);
+            Thread t = new Thread(() -> {
+                while (!server.isClosed()) {
+                    try {
+                        Socket s = server.accept();
+                        new Thread(() -> handleTcpClient(s), "TcpClient").start();
+                    } catch (Exception e) { /* accept 异常, 继续监听 */ }
+                }
+            }, "TcpServer");
+            t.setDaemon(true); t.start();
+        } catch (Exception e) {
+            logErr("TCP 服务启动失败(端口 " + TCP_PORT + " 可能被占用或权限不足): " + e.getMessage());
+        }
+    }
+
+    static void handleTcpClient(Socket s) {
+        try {
+            s.setSoTimeout(TCP_TIMEOUT);
+            InputStream in = s.getInputStream();
+            OutputStream out = s.getOutputStream();
+            byte[][] frame = readTcpFrame(in);
+            String cmdJson = new String(frame[0], StandardCharsets.UTF_8);
+            byte[] payload = frame[1];
+            String cmd = jsonGet(cmdJson, "cmd");
+            if ("PRINT".equals(cmd)) {
+                String prn = jsonGet(cmdJson, "prn");
+                if (prn == null || prn.isEmpty()) prn = jsonGet(cmdJson, "printer");
+                if (prn == null) prn = "";
+                String copiesStr = jsonGet(cmdJson, "copies");
+                int copies = (copiesStr != null) ? Integer.parseInt(copiesStr) : 1;
+                String paper = jsonGet(cmdJson, "paper");
+                String orientation = jsonGet(cmdJson, "orientation");
+                log("TCP PRINT prn=" + prn + " size=" + payload.length);
+                String res = queuePrintTcp(prn, payload, copies, paper, orientation);
+                writeTcpFrame(out, res, null);
+            } else if ("PREVIEW".equals(cmd)) {
+                String prn = jsonGet(cmdJson, "prn");
+                if (prn == null || prn.isEmpty()) prn = jsonGet(cmdJson, "printer");
+                if (prn == null) prn = "";
+                doPreviewTcp(payload, out);
+            } else {
+                writeTcpFrame(out, "{\"status\":\"FAIL\",\"msg\":\"unknown tcp cmd: " + escapeJson(String.valueOf(cmd)) + "\"}", null);
+            }
+        } catch (Exception e) {
+            logErr("TCP 处理异常: " + e.getMessage());
+        } finally {
+            try { s.close(); } catch (Exception ignore) {}
+        }
+    }
+
+    static void doPreviewTcp(byte[] payload, OutputStream out) {
+        try {
+            ContentType ct = detectContentType(payload);
+            List<BufferedImage> pages = renderPreviewPages(payload, ct);
+            byte[] blob = buildPreviewBlob(pages);
+            writeTcpFrame(out, "{\"cmd\":\"PREVIEW_READY\",\"pages\":" + pages.size() + ",\"size\":" + blob.length + "}", null);
+            writeTcpFrame(out, "{\"cmd\":\"PREVIEW_BLOB\",\"size\":" + blob.length + "}", blob);
+            log("TCP 预览就绪 pages=" + pages.size() + " blob=" + blob.length);
+        } catch (Exception e) {
+            logErr("TCP 预览渲染失败: " + e.getMessage());
+            try { writeTcpFrame(out, "{\"cmd\":\"PREVIEW_FAIL\",\"msg\":\"" + escapeJson(e.getMessage()) + "\"}", null); } catch (Exception ignore) {}
         }
     }
 
@@ -869,6 +1008,7 @@ public class UniversalPrintBridge {
 
             setupTray();
             startWatchdog();
+            startTcpServer();
 
             DatagramSocket socket = new DatagramSocket(UDP_PORT);
             log("UDP 监听端口 " + UDP_PORT);
