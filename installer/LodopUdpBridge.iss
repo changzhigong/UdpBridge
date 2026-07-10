@@ -43,8 +43,8 @@ Root: HKCU; Subkey: Software\Microsoft\Windows\CurrentVersion\Run; ValueType: st
 
 [Run]
 ; 放行防火墙: UDP 52010(局域网发现广播) + TCP 52011(打印上传/预览回传数据面)
-Filename: {sys}\netsh.exe; Parameters: "advfirewall firewall add rule name=""打印网关-UDP"" dir=in action=allow protocol=UDP localport=52010"; Flags: runhidden skiperror
-Filename: {sys}\netsh.exe; Parameters: "advfirewall firewall add rule name=""打印网关-TCP"" dir=in action=allow protocol=TCP localport=52011"; Flags: runhidden skiperror
+Filename: {sys}\netsh.exe; Parameters: "advfirewall firewall add rule name=""打印网关-UDP"" dir=in action=allow protocol=UDP localport=52010"; Flags: runhidden
+Filename: {sys}\netsh.exe; Parameters: "advfirewall firewall add rule name=""打印网关-TCP"" dir=in action=allow protocol=TCP localport=52011"; Flags: runhidden
 Filename: {app}\launch.vbs; Description: 启动打印网关（UDP 52010 发现 + TCP 52011 数据）; Flags: nowait postinstall runascurrentuser shellexec
 
 [Code]
