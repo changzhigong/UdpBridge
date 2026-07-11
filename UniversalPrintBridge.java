@@ -60,6 +60,14 @@ public class UniversalPrintBridge {
     // Office 转换引擎(LibreOffice), 启动时探测
     static String officeExe = null;
 
+    // 打印机缓存: 避免每次枚举都触发 Windows 11 WSD 打印机查询弹窗("请等待连接打印机")
+    static volatile PrintService[] printerCache = null;
+    static volatile long printerCacheTime = 0;
+    static final long PRINTER_CACHE_TTL = 60_000;
+    static String defaultPrinterName = null;
+    // 串行化 LibreOffice 转换, 避免并发抢同一 profile 锁导致转换失败/首次慢
+    static final Object officeLock = new Object();
+
     // ---- 打印任务 ----
     static class PrintTask {
         final String printer;
@@ -450,8 +458,26 @@ public class UniversalPrintBridge {
     }
 
     // 返回转换后 PDF 字节; 失败返回 null
+    // 串行化 + 重试: 避免 LibreOffice 单一 profile 锁被并发抢用导致首转失败/慢
     static byte[] convertToPdf(byte[] data, String baseName) {
         if (officeExe == null) return null;
+        byte[] result = null;
+        synchronized (officeLock) {
+            for (int attempt = 1; attempt <= 2 && result == null; attempt++) {
+                try {
+                    result = convertToPdfOnce(data, baseName);
+                } catch (Exception e) {
+                    logErr("Office 转换异常(尝试" + attempt + "): " + e.getMessage());
+                }
+                if (result == null && attempt < 2) {
+                    try { Thread.sleep(800); } catch (Exception ignore) {}
+                }
+            }
+        }
+        return result;
+    }
+
+    static byte[] convertToPdfOnce(byte[] data, String baseName) throws Exception {
         File inFile = null, outDir = null;
         try {
             outDir = new File(System.getProperty("java.io.tmpdir"), "upb_conv_" + System.nanoTime());
@@ -484,13 +510,36 @@ public class UniversalPrintBridge {
             }
             if (!pdf.exists()) { logErr("LibreOffice 未生成 PDF"); return null; }
             return readAll(pdf);
-        } catch (Exception e) {
-            logErr("Office 转换异常: " + e.getMessage());
-            return null;
         } finally {
             try { if (inFile != null) inFile.delete(); } catch (Exception ignore) {}
             try { if (outDir != null) deleteDir(outDir); } catch (Exception ignore) {}
         }
+    }
+
+    // 启动后后台预热 LibreOffice: 初始化用户 profile, 避免首次真实转换慢/失败
+    static void warmupOffice() {
+        if (officeExe == null) return;
+        new Thread(() -> {
+            try {
+                File dir = new File(System.getProperty("java.io.tmpdir"));
+                File tmp = new File(dir, "upb_warm_" + System.nanoTime() + ".txt");
+                try (FileWriter w = new FileWriter(tmp)) { w.write("warmup"); }
+                synchronized (officeLock) {
+                    ProcessBuilder pb = new ProcessBuilder(officeExe, "--headless", "--convert-to", "pdf",
+                        "--outdir", dir.getAbsolutePath(), tmp.getAbsolutePath());
+                    pb.redirectErrorStream(true);
+                    Process p = pb.start();
+                    p.waitFor(60, TimeUnit.SECONDS);
+                    p.destroyForcibly();
+                }
+                File pdf = new File(dir, tmp.getName().replaceFirst("\\.[^.]+$", "") + ".pdf");
+                if (pdf.exists()) pdf.delete();
+                tmp.delete();
+                log("LibreOffice 预热完成");
+            } catch (Exception e) {
+                logErr("LibreOffice 预热失败(不影响使用, 首次转换可能稍慢): " + e.getMessage());
+            }
+        }, "OfficeWarmup").start();
     }
 
     static byte[] readAll(File f) throws IOException {
@@ -781,25 +830,66 @@ public class UniversalPrintBridge {
 
     // ==================== 工具方法 ====================
 
+    // 读取打印机缓存(启动后由后台定时刷新; 首次未就绪时同步枚举一次)
+    static PrintService[] getPrinters() {
+        PrintService[] cached = printerCache;
+        if (cached != null) return cached;
+        synchronized (UniversalPrintBridge.class) {
+            if (printerCache != null) return printerCache;
+            try { printerCache = PrintServiceLookup.lookupPrintServices(null, null); }
+            catch (Exception e) { printerCache = new PrintService[0]; }
+            printerCacheTime = System.currentTimeMillis();
+        }
+        return printerCache;
+    }
+
+    // 强制刷新打印机缓存(在独立后台线程调用, 即便触发 WSD 弹窗也不阻塞请求线程)
+    static void refreshPrinters() {
+        try {
+            PrintService[] all = PrintServiceLookup.lookupPrintServices(null, null);
+            if (all != null) { printerCache = all; printerCacheTime = System.currentTimeMillis(); }
+        } catch (Exception e) { logErr("打印机刷新失败: " + e.getMessage()); }
+    }
+
+    static String safeDefaultName() {
+        try {
+            PrintService d = PrintServiceLookup.lookupDefaultPrintService();
+            return d != null ? d.getName() : null;
+        } catch (Exception e) { return null; }
+    }
+
     // 查找指定名称的打印机
     static PrintService findPrinter(String name) {
-        PrintService[] all = PrintServiceLookup.lookupPrintServices(null, null);
+        PrintService[] all = getPrinters();
         if (name != null && !name.isEmpty()) {
             for (PrintService ps : all) if (ps.getName().equals(name)) return ps;
             for (PrintService ps : all)
                 if (ps.getName().toLowerCase().contains(name.toLowerCase())) return ps;
+            // 兜底: 缓存未命中时做一次实时枚举(处理启动后新接入的打印机)
+            try {
+                for (PrintService ps : PrintServiceLookup.lookupPrintServices(null, null)) {
+                    if (ps.getName().equals(name) || ps.getName().toLowerCase().contains(name.toLowerCase()))
+                        return ps;
+                }
+            } catch (Exception ignore) {}
         }
-        return PrintServiceLookup.lookupDefaultPrintService();
+        return getDefaultPrinter();
     }
 
-    // 列出所有打印机
+    static PrintService getDefaultPrinter() {
+        if (defaultPrinterName == null) return null;
+        for (PrintService ps : getPrinters())
+            if (ps.getName().equals(defaultPrinterName)) return ps;
+        return null;
+    }
+
+    // 列出所有打印机(走缓存, 不触发实时枚举)
     static String listPrinters() {
-        PrintService[] all = PrintServiceLookup.lookupPrintServices(null, null);
-        PrintService def = PrintServiceLookup.lookupDefaultPrintService();
+        PrintService[] all = getPrinters();
         StringBuilder sb = new StringBuilder("[");
         for (int i = 0; i < all.length; i++) {
             PrintService ps = all[i];
-            boolean isDef = def != null && ps.getName().equals(def.getName());
+            boolean isDef = defaultPrinterName != null && ps.getName().equals(defaultPrinterName);
             if (i > 0) sb.append(",");
             sb.append("{\"name\":\"").append(escapeJson(ps.getName())).append("\"");
             sb.append(",\"default\":").append(isDef).append("}");
@@ -1001,7 +1091,9 @@ public class UniversalPrintBridge {
             log = new PrintWriter(new FileWriter(LOG_DIR + "\\universal_bridge.log", true), true);
             log("=== 通用打印网关启动 (UDP:" + UDP_PORT + ") ===");
             log("JRE: " + System.getProperty("java.version"));
-            log("打印机数量: " + PrintServiceLookup.lookupPrintServices(null, null).length);
+            refreshPrinters();                              // 启动时枚举一次(可能触发一次 WSD 弹窗)
+            defaultPrinterName = safeDefaultName();
+            log("打印机数量: " + (printerCache != null ? printerCache.length : 0));
 
             officeExe = findOfficeExe();
             log("Office 转换引擎: " + (officeExe != null ? officeExe : "未找到(Office 文档需安装 LibreOffice)"));
@@ -1009,6 +1101,13 @@ public class UniversalPrintBridge {
             setupTray();
             startWatchdog();
             startTcpServer();
+
+            // 后台定时刷新打印机缓存: 避免每次 DISCOVER/LIST/打印都实时枚举触发 Windows WSD 弹窗
+            Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "PrinterRefresh"); t.setDaemon(true); return t;
+            }).scheduleAtFixedRate(() -> refreshPrinters(), 60, 60, TimeUnit.SECONDS);
+            // LibreOffice 预热: 初始化 profile, 避免首次 Office 转换慢/失败
+            warmupOffice();
 
             DatagramSocket socket = new DatagramSocket(UDP_PORT);
             log("UDP 监听端口 " + UDP_PORT);

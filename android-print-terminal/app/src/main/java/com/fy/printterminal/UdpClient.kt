@@ -3,6 +3,7 @@ package com.fy.printterminal
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
 import java.io.IOException
@@ -199,7 +200,8 @@ object UdpClient {
             }
             pagesOut
         } catch (e: IOException) {
-            emptyList()
+            // 不再吞成空列表, 上抛以便 requestPreview 重试并向用户展示真实错误
+            throw e
         } finally {
             try { socket?.close() } catch (_: Exception) {}
         }
@@ -369,6 +371,8 @@ object UdpClient {
 
     /**
      * 请求预览: 上传文件到 PC 网关, PC 渲染为每页 PNG 并回传(走 TCP 可靠传输)
+     * 内置自动重试(最多3次, 间隔600ms): 规避 LibreOffice 首次转换慢/抢锁失败等瞬时问题。
+     * 全部失败后抛出真实异常, 由 UI 层展示具体原因(而非笼统"预览为空")。
      * @return 每页 PNG 图片字节列表(顺序)
      */
     suspend fun requestPreview(
@@ -376,7 +380,19 @@ object UdpClient {
         type: String,
         printer: String,
         data: ByteArray
-    ): List<ByteArray> = tcpPreview(gatewayIp, type, printer, data)
+    ): List<ByteArray> {
+        var lastErr: Exception? = null
+        repeat(3) { attempt ->
+            try {
+                val pages = tcpPreview(gatewayIp, type, printer, data)
+                if (pages.isNotEmpty()) return pages
+            } catch (e: Exception) {
+                lastErr = e
+            }
+            if (attempt < 2) kotlinx.coroutines.delay(600)
+        }
+        throw lastErr ?: IOException("预览为空")
+    }
 
     private fun escapeJson(s: String): String {
         return s.replace("\\", "\\\\")
