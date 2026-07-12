@@ -20,8 +20,8 @@ android {
         applicationId = "com.fy.printterminal"
         minSdk = 26
         targetSdk = 34
-        versionCode = 4
-        versionName = "1.7.0"
+        versionCode = 5
+        versionName = "1.7.1"
     }
 
     buildTypes {

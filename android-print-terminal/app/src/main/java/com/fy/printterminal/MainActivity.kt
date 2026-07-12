@@ -70,7 +70,7 @@ class MainActivity : AppCompatActivity() {
                 val gw = UdpClient.discover()
                 withContext(Dispatchers.Main) {
                     gatewayIp = gw.ip
-                    tvGatewayStatus.text = "已连接: ${gw.hostname} (${gw.ip})"
+                    tvGatewayStatus.text = "已连接: ${gw.hostname} (${gw.ip})  网关版本:${gw.version}"
                     printerList.clear()
                     printerList.addAll(gw.printers)
                     printerAdapter.notifyDataSetChanged()

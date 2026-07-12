@@ -45,6 +45,7 @@ import org.apache.pdfbox.rendering.ImageType;
 
 public class UniversalPrintBridge {
     static final int UDP_PORT = 52010;
+    static final String VERSION = "1.7.1";        // 网关版本(回传安卓显示)
     static final int MAX_PACKET = 65507;
     static final int CHUNK_SIZE = 8000;          // 安卓→PC 上传分片
     static final int PREVIEW_CHUNK_SIZE = 6000;  // PC→安卓 预览回传分片(旧版UDP兼容)
@@ -1089,7 +1090,7 @@ public class UniversalPrintBridge {
         try {
             new File(LOG_DIR).mkdirs();
             log = new PrintWriter(new FileWriter(LOG_DIR + "\\universal_bridge.log", true), true);
-            log("=== 通用打印网关启动 (UDP:" + UDP_PORT + ") ===");
+            log("=== 通用打印网关 v" + VERSION + " 启动 (UDP:" + UDP_PORT + ") ===");
             log("JRE: " + System.getProperty("java.version"));
             refreshPrinters();                              // 启动时枚举一次(可能触发一次 WSD 弹窗)
             defaultPrinterName = safeDefaultName();
@@ -1109,8 +1110,20 @@ public class UniversalPrintBridge {
             // LibreOffice 预热: 初始化 profile, 避免首次 Office 转换慢/失败
             warmupOffice();
 
-            DatagramSocket socket = new DatagramSocket(UDP_PORT);
-            log("UDP 监听端口 " + UDP_PORT);
+            // 【Win11 修复】强制绑定 IPv4 通配地址 0.0.0.0，而非依赖系统双栈(可能绑成 :: 而收不到 IPv4 受限广播 255.255.255.255)
+            // Win11 默认开启 IPv6，new DatagramSocket(port) 会建 :: 双栈 socket；Windows 不会把 IPv4 受限广播投递给 :: 双栈 socket，
+            // 导致安卓的 DISCOVER 广播永远进不来 -> 安卓扫描 poll timed out。绑定 0.0.0.0 可稳定接收 IPv4 广播与定向广播。
+            DatagramSocket socket;
+            try {
+                socket = new DatagramSocket(new InetSocketAddress("0.0.0.0", UDP_PORT));
+            } catch (SocketException e) {
+                // 绑定失败(如端口被占用/被安全软件拦截): 给出明确提示, 避免静默死亡
+                logErr("FATAL: UDP 端口 " + UDP_PORT + " 绑定失败 -> " + e.getMessage());
+                logErr("提示: 1)确认无其他程序占用 52010; 2)若报权限/访问被拒, 检查杀软或 Defender 网络保护是否拦截监听; 3)可用 `netstat -an -p UDP | find \"52010\"` 排查");
+                throw e;
+            }
+            socket.setBroadcast(true); // 确保可收发广播(回包为单播, 但开启广播选项更稳妥)
+            log("UDP 监听端口 " + UDP_PORT + " (已绑定 0.0.0.0 强制 IPv4, 兼容 Win11 广播发现)");
             byte[] buf = new byte[MAX_PACKET];
 
             while (true) {
@@ -1137,6 +1150,7 @@ public class UniversalPrintBridge {
                     String printers = listPrinters();
                     String resp = "{\"cmd\":\"DISCOVER_ACK\",\"hostname\":\"" + escapeJson(hostname)
                         + "\",\"ip\":\"" + ip + "\",\"port\":" + UDP_PORT
+                        + ",\"version\":\"" + VERSION + "\""
                         + ",\"printers\":" + printers + "}";
                     sendJson(socket, addr, rport, resp);
                     log("DISCOVER from " + addr.getHostAddress() + ":" + rport + " -> ip=" + ip);

@@ -13,6 +13,8 @@ import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.InetSocketAddress
+import java.net.Inet4Address
+import java.net.NetworkInterface
 import java.net.Socket
 import java.net.SocketTimeoutException
 
@@ -25,6 +27,7 @@ object UdpClient {
     private const val UDP_PORT = 52010
     private const val TCP_PORT = 52011
     private const val BROADCAST_TIMEOUT = 3000
+    private const val DISCOVER_TOTAL_TIMEOUT = 5000   // 发现阶段总超时(多轮重试窗口)
     private const val MAX_BUFFER = 65507
     private const val CHUNK_SIZE = 8000
     private const val PREVIEW_CHUNK_SIZE = 6000
@@ -38,7 +41,8 @@ object UdpClient {
         val hostname: String,
         val ip: String,
         val port: Int,
-        val printers: List<PrinterInfo>
+        val printers: List<PrinterInfo>,
+        val version: String = ""   // PC 网关版本号(DISCOVER_ACK 带回, 与安卓端 versionName 对应)
     )
 
     data class PrinterInfo(
@@ -54,6 +58,10 @@ object UdpClient {
 
     /**
      * 广播发现打印网关
+     * 改进(Win11 兼容): 先按本机各 IPv4 子网发"定向广播"(如 192.168.1.255),
+     * 再回退到受限广播 255.255.255.255; 全程在 DISCOVER_TOTAL_TIMEOUT 内对全部目标多次重试,
+     * 任一轮收到 DISCOVER_ACK 即返回。即便 Windows 双栈/虚拟网卡导致 255.255.255.255 不可达,
+     * 也能通过定向广播命中网关, 避免安卓侧 poll timed out。
      */
     suspend fun discover(): GatewayInfo = withContext(Dispatchers.IO) {
         val socket = DatagramSocket().apply {
@@ -62,20 +70,62 @@ object UdpClient {
         }
 
         try {
+            val targets = collectBroadcastTargets()
             val request = """{"cmd":"DISCOVER"}""".toByteArray(Charsets.UTF_8)
-            socket.send(DatagramPacket(
-                request, request.size,
-                InetAddress.getByName("255.255.255.255"), UDP_PORT
-            ))
-
             val buf = ByteArray(MAX_BUFFER)
-            val packet = DatagramPacket(buf, buf.size)
-            socket.receive(packet)
+            val deadline = System.currentTimeMillis() + DISCOVER_TOTAL_TIMEOUT
+            var lastErr: Exception? = null
 
-            parseGatewayResponse(String(packet.data, 0, packet.length))
+            while (System.currentTimeMillis() < deadline) {
+                // 本轮回发所有广播目标(定向广播优先, 255.255.255.255 兜底)
+                for (target in targets) {
+                    try {
+                        socket.send(DatagramPacket(request, request.size, target, UDP_PORT))
+                    } catch (e: Exception) {
+                        lastErr = e // 个别目标不可达(如 255.255.255.255 被系统限制)不影响其他目标
+                    }
+                }
+                // 等待回应(单轮超时 BROADCAST_TIMEOUT, 超时则进入下一轮重试)
+                try {
+                    val packet = DatagramPacket(buf, buf.size)
+                    socket.receive(packet)
+                    val info = parseGatewayResponse(String(packet.data, 0, packet.length, Charsets.UTF_8))
+                    if (info.ip != "0.0.0.0") return@withContext info
+                } catch (e: SocketTimeoutException) {
+                    lastErr = e
+                }
+            }
+            throw SocketTimeoutException("扫描失败: poll timed out").apply { initCause(lastErr) }
         } finally {
             socket.close()
         }
+    }
+
+    /**
+     * 收集本机所有 IPv4 子网的定向广播地址(如 192.168.1.255), 末尾追加受限广播 255.255.255.255 作兜底。
+     * 定向广播比受限广播在 Win11 / 虚拟网卡环境下更可靠(部分 Android 版本还会拦截 255.255.255.255)。
+     */
+    private fun collectBroadcastTargets(): List<InetAddress> {
+        val list = mutableListOf<InetAddress>()
+        try {
+            val interfaces = NetworkInterface.getNetworkInterfaces()
+            for (intf in interfaces) {
+                if (intf.isLoopback || !intf.isUp) continue
+                for (addr in intf.interfaceAddresses) {
+                    val a = addr.address
+                    if (a is Inet4Address && !a.isLoopbackAddress) {
+                        val bc = addr.broadcast
+                        if (bc != null && !list.contains(bc)) list.add(bc)
+                    }
+                }
+            }
+        } catch (_: Exception) { /* 枚举失败则用兜底广播 */ }
+        // 兜底: 受限广播(部分 Android 版本会拦截, 但大多数仍可发)
+        try {
+            val limited = InetAddress.getByName("255.255.255.255")
+            if (!list.contains(limited)) list.add(limited)
+        } catch (_: Exception) { }
+        return list
     }
 
     /**
@@ -342,8 +392,9 @@ object UdpClient {
         val hostname = jsonGet(json, "hostname") ?: "UNKNOWN"
         val ip = jsonGet(json, "ip") ?: "0.0.0.0"
         val port = jsonGetInt(json, "port", UDP_PORT)
+        val version = jsonGet(json, "version") ?: ""
         val printers = parsePrinterList(json)
-        return GatewayInfo(hostname, ip, port, printers)
+        return GatewayInfo(hostname, ip, port, printers, version)
     }
 
     private fun parsePrinterList(json: String): List<PrinterInfo> {
