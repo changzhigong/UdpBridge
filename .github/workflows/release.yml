@@ -57,9 +57,24 @@ jobs:
           $ver = "26.2.4"
           $url = "https://download.documentfoundation.org/libreoffice/stable/$ver/win/x86_64/LibreOffice_${ver}_Win_x86-64.msi"
           $msi = "installer\LibreOffice.msi"
-          Write-Host "Downloading LibreOffice $ver ..."
-          Invoke-WebRequest -Uri $url -OutFile $msi
           $target = Join-Path $PWD "installer\LibreOffice"
+          Write-Host "Downloading LibreOffice $ver ..."
+          # 用 curl 下载: 原生支持断点续传(-C -)与失败自动重试(--retry), 规避海外大文件传输偶发断流
+          # WindowsPowerShell 5.1 的 Invoke-WebRequest 无重试参数, 单点抖动即整构建失败
+          $ok = $false
+          for ($i = 1; $i -le 6; $i++) {
+            try {
+              Write-Host "Download attempt $i/6 ..."
+              curl.exe -L --retry 5 --retry-all-errors --retry-delay 5 -C - -o $msi $url
+              if (Test-Path $msi -and (Get-Item $msi).Length -gt 100MB) { $ok = $true; break }
+              Write-Host "MSI size too small, retrying"
+            } catch {
+              Write-Host "Download attempt $i failed: $_"
+              Start-Sleep -Seconds 3
+            }
+          }
+          if (-not $ok) { throw "LibreOffice download failed after 6 attempts" }
+          Write-Host "Download OK: $([math]::Round((Get-Item $msi).Length/1MB, 1)) MB"
           Write-Host "Extracting via msiexec /a to $target ..."
           $p = Start-Process msiexec.exe -ArgumentList "/a","$msi","TARGETDIR=$target","/qn" -Wait -PassThru
           if ($p.ExitCode -ne 0) { throw "msiexec /a failed: $($p.ExitCode)" }
