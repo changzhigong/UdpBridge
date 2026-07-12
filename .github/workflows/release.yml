@@ -54,32 +54,27 @@ jobs:
       - name: Bundle LibreOffice (portable, for Office→PDF conversion)
         shell: powershell
         run: |
-          $ver = "26.2.4"
-          $url = "https://download.documentfoundation.org/libreoffice/stable/$ver/win/x86_64/LibreOffice_${ver}_Win_x86-64.msi"
-          $msi = "installer\LibreOffice.msi"
-          $target = Join-Path $PWD "installer\LibreOffice"
-          Write-Host "Downloading LibreOffice $ver ..."
-          # 用 curl 下载: 原生支持断点续传(-C -)与失败自动重试(--retry), 规避海外大文件传输偶发断流
-          # WindowsPowerShell 5.1 的 Invoke-WebRequest 无重试参数, 单点抖动即整构建失败
-          $ok = $false
-          for ($i = 1; $i -le 6; $i++) {
-            try {
-              Write-Host "Download attempt $i/6 ..."
-              curl.exe -L --retry 5 --retry-all-errors --retry-delay 5 -C - -o $msi $url
-              if (Test-Path $msi -and (Get-Item $msi).Length -gt 100MB) { $ok = $true; break }
-              Write-Host "MSI size too small, retrying"
-            } catch {
-              Write-Host "Download attempt $i failed: $_"
-              Start-Sleep -Seconds 3
+          # 通过 Chocolatey 安装 LibreOffice: 走 Chocolatey CDN(Azure 同区域, 稳定),
+          # 规避 documentfoundation.org 海外 360MB MSI 在 Azure runner 上偶发断流 / 续传返回错误页的问题
+          # (已验证: 同环境的 "choco install innosetup" 步骤可成功, 证明 choco 源在本 CI 可用)
+          Write-Host "Installing LibreOffice via Chocolatey ..."
+          $installed = $false
+          foreach ($pkg in @("libreoffice", "libreoffice-fresh")) {
+            Write-Host "try choco install $pkg ..."
+            choco install $pkg --no-progress -y
+            if (($LASTEXITCODE -eq 0) -and (Test-Path "C:\Program Files\LibreOffice\program\soffice.exe")) {
+              $installed = $true
+              break
             }
           }
-          if (-not $ok) { throw "LibreOffice download failed after 6 attempts" }
-          Write-Host "Download OK: $([math]::Round((Get-Item $msi).Length/1MB, 1)) MB"
-          Write-Host "Extracting via msiexec /a to $target ..."
-          $p = Start-Process msiexec.exe -ArgumentList "/a","$msi","TARGETDIR=$target","/qn" -Wait -PassThru
-          if ($p.ExitCode -ne 0) { throw "msiexec /a failed: $($p.ExitCode)" }
-          Remove-Item $msi -Force
-          if (Test-Path "$target\program\soffice.exe") { Write-Host "LibreOffice bundled OK" } else { throw "soffice.exe not found after extraction" }
+          if (-not $installed) { throw "LibreOffice install failed (choco)" }
+          $src = "C:\Program Files\LibreOffice"
+          $dst = Join-Path $PWD "installer\LibreOffice"
+          if (Test-Path $dst) { Remove-Item $dst -Recurse -Force }
+          Copy-Item $src $dst -Recurse
+          $exe = "$dst\program\soffice.exe"
+          if (-not (Test-Path $exe)) { throw "soffice.exe not found after copy" }
+          Write-Host "LibreOffice bundled OK: $([math]::Round((Get-Item $exe).Length/1MB, 1)) MB"
 
       - name: Compile Inno Setup
         shell: powershell
