@@ -34,6 +34,7 @@ dist-bridge/innosetup.exe
 # === Android 构建产物 ===
 android-print-terminal/**/build/
 android-print-terminal/**/*.apk
+android-print-terminal/.gradle/
 
 # === 签名密钥(不入库) ===
 *.keystore

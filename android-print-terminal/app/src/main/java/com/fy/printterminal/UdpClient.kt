@@ -148,8 +148,11 @@ object UdpClient {
         data: ByteArray,
         copies: Int = 1,
         paper: String = "",
-        orientation: String = ""
-    ): PrintResult = printRaw(gatewayIp, type, printer, data, copies, paper, orientation)
+        orientation: String = "",
+        pages: String = "",
+        oddEven: String = "all",
+        duplex: String = "off"
+    ): PrintResult = printRaw(gatewayIp, type, printer, data, copies, paper, orientation, pages, oddEven, duplex)
 
     /**
      * 发送打印任务 (分片 UDP 传输, 支持大文件)
@@ -165,8 +168,11 @@ object UdpClient {
         data: ByteArray,
         copies: Int = 1,
         paper: String = "",
-        orientation: String = ""
-    ): PrintResult = tcpPrint(gatewayIp, type, printer, data, copies, paper, orientation)
+        orientation: String = "",
+        pages: String = "",
+        oddEven: String = "all",
+        duplex: String = "off"
+    ): PrintResult = tcpPrint(gatewayIp, type, printer, data, copies, paper, orientation, pages, oddEven, duplex)
 
     /**
      * 打印文件上传走 TCP(可靠, 不分片). 单连接单命令:
@@ -174,7 +180,8 @@ object UdpClient {
      */
     private suspend fun tcpPrint(
         gatewayIp: String, type: String, printer: String, data: ByteArray,
-        copies: Int, paper: String, orientation: String
+        copies: Int, paper: String, orientation: String,
+        pages: String = "", oddEven: String = "all", duplex: String = "off"
     ): PrintResult = withContext(Dispatchers.IO) {
         if (data.isEmpty()) return@withContext PrintResult("FAIL", "empty data")
         var socket: Socket? = null
@@ -193,6 +200,9 @@ object UdpClient {
                 append("\"copies\":$copies,")
                 append("\"paper\":\"${escapeJson(paper)}\",")
                 append("\"orientation\":\"${escapeJson(orientation)}\",")
+                append("\"pages\":\"${escapeJson(pages)}\",")
+                append("\"oddEven\":\"${escapeJson(oddEven)}\",")
+                append("\"duplex\":\"${escapeJson(duplex)}\",")
                 append("\"size\":${data.size}")
                 append("}")
             }
@@ -318,11 +328,14 @@ object UdpClient {
         bitmap: Bitmap,
         copies: Int = 1,
         paper: String = "",
-        orientation: String = ""
+        orientation: String = "",
+        pages: String = "",
+        oddEven: String = "all",
+        duplex: String = "off"
     ): PrintResult {
         val stream = ByteArrayOutputStream()
         bitmap.compress(Bitmap.CompressFormat.PNG, 100, stream)
-        return printBase64(gatewayIp, "IMAGE", printer, stream.toByteArray(), copies, paper, orientation)
+        return printBase64(gatewayIp, "IMAGE", printer, stream.toByteArray(), copies, paper, orientation, pages, oddEven, duplex)
     }
 
     /**
@@ -334,9 +347,12 @@ object UdpClient {
         pdfBytes: ByteArray,
         copies: Int = 1,
         paper: String = "",
-        orientation: String = ""
+        orientation: String = "",
+        pages: String = "",
+        oddEven: String = "all",
+        duplex: String = "off"
     ): PrintResult {
-        return printBase64(gatewayIp, "PDF", printer, pdfBytes, copies, paper, orientation)
+        return printBase64(gatewayIp, "PDF", printer, pdfBytes, copies, paper, orientation, pages, oddEven, duplex)
     }
 
     /**
@@ -348,9 +364,12 @@ object UdpClient {
         text: String,
         copies: Int = 1,
         paper: String = "",
-        orientation: String = ""
+        orientation: String = "",
+        pages: String = "",
+        oddEven: String = "all",
+        duplex: String = "off"
     ): PrintResult {
-        return printBase64(gatewayIp, "TEXT", printer, text.toByteArray(Charsets.UTF_8), copies, paper, orientation)
+        return printBase64(gatewayIp, "TEXT", printer, text.toByteArray(Charsets.UTF_8), copies, paper, orientation, pages, oddEven, duplex)
     }
 
     // ---- 底层 UDP 发送 ----

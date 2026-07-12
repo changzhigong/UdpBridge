@@ -79,6 +79,7 @@ public class UniversalPrintBridge {
         InetAddress addr;
         int port;
         String paper, orientation;
+        String pages = "", oddEven = "all", duplex = "off";
         java.util.concurrent.CompletableFuture<String> future = new java.util.concurrent.CompletableFuture<>();
 
         PrintTask(String printer, byte[] data, int copies) {
@@ -152,17 +153,81 @@ public class UniversalPrintBridge {
 
                 PageFormat pf = buildPageFormat(doc, task.paper, task.orientation);
                 if (pf == null) pf = job.defaultPage();
-                PDFPrintable printable = new PDFPrintable(doc, Scaling.SCALE_TO_FIT);
-                Book book = new Book();
-                book.append(printable, pf, doc.getNumberOfPages());
 
-                if (task.copies > 1) job.setCopies(task.copies);
-                job.setPageable(book);
-                job.print();
-                return true;
+                // 解析所选页(0-based 升序去重); 页码范围/奇偶过滤后为空则报错
+                List<Integer> sel = parsePageSelection(doc.getNumberOfPages(), task.pages, task.oddEven);
+                if (sel.isEmpty()) {
+                    boolean explicit = (task.pages != null && !task.pages.trim().isEmpty())
+                            || (task.oddEven != null && !"all".equalsIgnoreCase(task.oddEven));
+                    if (explicit) {
+                        logErr("无有效页码(范围/奇偶过滤后为空): pages=" + task.pages + " oddEven=" + task.oddEven);
+                        return false;
+                    }
+                    for (int i = 0; i < doc.getNumberOfPages(); i++) sel.add(i);
+                }
+
+                // 构造子集文档(保留矢量精度), 再打印
+                PDDocument sub = new PDDocument();
+                try {
+                    for (int idx : sel) sub.importPage(doc.getPage(idx));
+                    PDFPrintable printable = new PDFPrintable(sub, Scaling.SCALE_TO_FIT);
+                    Book book = new Book();
+                    book.append(printable, pf, sub.getNumberOfPages());
+
+                    PrintRequestAttributeSet aset = new HashPrintRequestAttributeSet();
+                    if (task.copies > 1) aset.add(new Copies(task.copies));
+                    String duplexMsg = "";
+                    if (task.duplex != null && !"off".equalsIgnoreCase(task.duplex)) {
+                        if (ps.isAttributeCategorySupported(Sides.class)) {
+                            Sides sides = "short".equalsIgnoreCase(task.duplex)
+                                    ? Sides.TWO_SIDED_SHORT_EDGE : Sides.TWO_SIDED_LONG_EDGE;
+                            aset.add(sides);
+                            duplexMsg = " duplex=" + sides;
+                        } else {
+                            duplexMsg = " (打印机不支持双面, 已退回单面)";
+                            log("打印机不支持双面, 退回单面: " + task.printer);
+                        }
+                    }
+                    job.setPageable(book);
+                    job.print(aset);
+                    log("PDF 打印完成 pages=" + sel.size() + " copies=" + task.copies + duplexMsg);
+                    return true;
+                } finally {
+                    sub.close();
+                }
             } finally {
                 doc.close();
             }
+        }
+
+        // 解析页码范围(如 "1-3,5,7-9") + 奇偶过滤, 返回升序去重的 0-based 索引列表
+        static List<Integer> parsePageSelection(int totalPages, String pages, String oddEven) {
+            Set<Integer> set = new TreeSet<>();
+            if (pages != null && !pages.trim().isEmpty()) {
+                for (String part : pages.split("[,;]")) {
+                    String p = part.trim();
+                    if (p.isEmpty()) continue;
+                    try {
+                        if (p.contains("-")) {
+                            String[] ab = p.split("-");
+                            int a = Integer.parseInt(ab[0].trim());
+                            int b = Integer.parseInt(ab[1].trim());
+                            int lo = Math.min(a, b), hi = Math.max(a, b);
+                            for (int i = lo; i <= hi; i++)
+                                if (i >= 1 && i <= totalPages) set.add(i - 1);
+                        } else {
+                            int i = Integer.parseInt(p);
+                            if (i >= 1 && i <= totalPages) set.add(i - 1);
+                        }
+                    } catch (NumberFormatException e) { /* 忽略非法片段 */ }
+                }
+            }
+            if ("odd".equalsIgnoreCase(oddEven)) {
+                set.removeIf(idx -> ((idx + 1) % 2 == 0));
+            } else if ("even".equalsIgnoreCase(oddEven)) {
+                set.removeIf(idx -> ((idx + 1) % 2 == 1));
+            }
+            return new ArrayList<>(set);
         }
 
         // 构建打印页面格式：用户指定优先，否则按文档第一页真实尺寸/方向
@@ -299,6 +364,7 @@ public class UniversalPrintBridge {
         int rounds = 0;
         boolean done = false;
         String paper, orientation;
+        String pages = "", oddEven = "all", duplex = "off";
     }
 
     static String key(InetAddress a, int p) { return a.getHostAddress() + ":" + p; }
@@ -347,7 +413,8 @@ public class UniversalPrintBridge {
         byte[] payload = a.buffer;
         log("分片组装完成 mode=" + a.mode + " prn=" + a.printer + " size=" + payload.length);
         if (a.mode == Mode.PRINT) {
-            queuePrint(a.printer, payload, a.copies, a.paper, a.orientation, a.socket, a.addr, a.port);
+            queuePrint(a.printer, payload, a.copies, a.paper, a.orientation, a.pages, a.oddEven, a.duplex,
+                a.socket, a.addr, a.port);
         } else {
             doPreview(payload, a.socket, a.addr, a.port);
         }
@@ -355,10 +422,15 @@ public class UniversalPrintBridge {
     }
 
     // 提交打印任务到单线程队列(打印/预览共用, 保证打印机独占串行)
-    static PrintTask submitPrintTask(String prn, byte[] payload, int copies, String paper, String orientation) {
-        log("PRINT prn=" + prn + " size=" + payload.length + " copies=" + copies + " paper=" + paper + " orient=" + orientation);
+    static PrintTask submitPrintTask(String prn, byte[] payload, int copies, String paper, String orientation,
+                                     String pages, String oddEven, String duplex) {
+        log("PRINT prn=" + prn + " size=" + payload.length + " copies=" + copies + " paper=" + paper
+            + " orient=" + orientation + " pages=" + pages + " oddEven=" + oddEven + " duplex=" + duplex);
         PrintTask task = new PrintTask(prn, payload, copies);
         task.paper = paper; task.orientation = orientation;
+        task.pages = (pages == null) ? "" : pages;
+        task.oddEven = (oddEven == null || oddEven.isEmpty()) ? "all" : oddEven;
+        task.duplex = (duplex == null) ? "off" : duplex;
         PrintQueue.INSTANCE.submit(task);
         return task;
     }
@@ -366,8 +438,9 @@ public class UniversalPrintBridge {
     // UDP 旧版兼容: 提交后通过 UDP socket 回 QUEUED(已升级安卓端不再走此路径)
     @SuppressWarnings("deprecation")
     static void queuePrint(String prn, byte[] payload, int copies, String paper, String orientation,
+                           String pages, String oddEven, String duplex,
                            DatagramSocket socket, InetAddress addr, int port) {
-        PrintTask task = submitPrintTask(prn, payload, copies, paper, orientation);
+        PrintTask task = submitPrintTask(prn, payload, copies, paper, orientation, pages, oddEven, duplex);
         task.socket = socket; task.addr = addr; task.port = port;
         try {
             sendJson(socket, addr, port,
@@ -376,8 +449,9 @@ public class UniversalPrintBridge {
     }
 
     // TCP 数据面: 提交打印并阻塞等待结果(单连接单命令)
-    static String queuePrintTcp(String prn, byte[] payload, int copies, String paper, String orientation) {
-        PrintTask task = submitPrintTask(prn, payload, copies, paper, orientation);
+    static String queuePrintTcp(String prn, byte[] payload, int copies, String paper, String orientation,
+                                String pages, String oddEven, String duplex) {
+        PrintTask task = submitPrintTask(prn, payload, copies, paper, orientation, pages, oddEven, duplex);
         try {
             return task.future.get(TCP_TIMEOUT, java.util.concurrent.TimeUnit.MILLISECONDS);
         } catch (java.util.concurrent.TimeoutException te) {
@@ -688,8 +762,11 @@ public class UniversalPrintBridge {
                 int copies = (copiesStr != null) ? Integer.parseInt(copiesStr) : 1;
                 String paper = jsonGet(cmdJson, "paper");
                 String orientation = jsonGet(cmdJson, "orientation");
+                String pages = jsonGet(cmdJson, "pages");
+                String oddEven = jsonGet(cmdJson, "oddEven");
+                String duplex = jsonGet(cmdJson, "duplex");
                 log("TCP PRINT prn=" + prn + " size=" + payload.length);
-                String res = queuePrintTcp(prn, payload, copies, paper, orientation);
+                String res = queuePrintTcp(prn, payload, copies, paper, orientation, pages, oddEven, duplex);
                 writeTcpFrame(out, res, null);
             } else if ("PREVIEW".equals(cmd)) {
                 String prn = jsonGet(cmdJson, "prn");
@@ -1178,6 +1255,9 @@ public class UniversalPrintBridge {
                         a.printer = prn; a.copies = copies;
                         a.paper = jsonGet(cmdJson, "paper");
                         a.orientation = jsonGet(cmdJson, "orientation");
+                        a.pages = jsonGet(cmdJson, "pages");
+                        a.oddEven = jsonGet(cmdJson, "oddEven");
+                        a.duplex = jsonGet(cmdJson, "duplex");
                         a.size = size; a.total = total;
                         a.buffer = new byte[size];
                         a.addr = addr; a.port = rport; a.socket = socket;

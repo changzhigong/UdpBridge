@@ -5,6 +5,7 @@ import android.os.Bundle
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.ArrayAdapter
+import android.widget.EditText
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.Spinner
@@ -54,6 +55,21 @@ class PrintPreviewActivity : AppCompatActivity() {
             setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
         }
 
+        val etCopies = findViewById<EditText>(R.id.etCopies)
+        val etPages = findViewById<EditText>(R.id.etPages)
+        val spinnerOddEven = findViewById<Spinner>(R.id.spinnerOddEven)
+        val spinnerDuplex = findViewById<Spinner>(R.id.spinnerDuplex)
+        spinnerOddEven.adapter = ArrayAdapter(this,
+            android.R.layout.simple_spinner_item,
+            arrayOf("全部", "奇数页", "偶数页")).apply {
+            setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        }
+        spinnerDuplex.adapter = ArrayAdapter(this,
+            android.R.layout.simple_spinner_item,
+            arrayOf("单面", "长边翻(纵向双面)", "短边翻(横向双面)")).apply {
+            setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        }
+
         tvTitle.text = "打印预览 ($type) → $printer"
 
         if (bytes == null || bytes.isEmpty()) {
@@ -83,7 +99,19 @@ class PrintPreviewActivity : AppCompatActivity() {
                 val result = withContext(Dispatchers.IO) {
                     val paper = if (spinnerPaper.selectedItem.toString() == "自动") "" else spinnerPaper.selectedItem.toString()
                     val orient = if (spinnerOrientation.selectedItem.toString() == "自动") "" else spinnerOrientation.selectedItem.toString()
-                    UdpClient.printRaw(gatewayIp, type, printer, bytes, 1, paper, orient)
+                    val copies = (etCopies.text.toString().toIntOrNull() ?: 1).coerceIn(1, 999)
+                    val pages = etPages.text.toString().trim()
+                    val oddEven = when (spinnerOddEven.selectedItem.toString()) {
+                        "奇数页" -> "odd"
+                        "偶数页" -> "even"
+                        else -> "all"
+                    }
+                    val duplex = when (spinnerDuplex.selectedItem.toString()) {
+                        "长边翻(纵向双面)" -> "long"
+                        "短边翻(横向双面)" -> "short"
+                        else -> "off"
+                    }
+                    UdpClient.printRaw(gatewayIp, type, printer, bytes, copies, paper, orient, pages, oddEven, duplex)
                 }
                     if (result.status == "QUEUED" || result.status == "DONE") {
                         Toast.makeText(this@PrintPreviewActivity, "打印任务已提交", Toast.LENGTH_SHORT).show()
