@@ -3,7 +3,7 @@
 
 [Setup]
 AppName=打印网关
-AppVersion=1.8.0
+AppVersion=1.8.1
 AppPublisher=郑州晖锦
 DefaultDirName={autopf}\打印网关
 DefaultGroupName=打印网关

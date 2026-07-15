@@ -877,6 +877,15 @@ public class LodopUdpBridge {
         // 初始化日志文件（必须最先调用）
         initLog();
 
+        // 单实例校验（必须最先执行，在任何耗时操作之前）
+        // 防止启动竞态：先连接 CLodop / 初始化托盘 再校验锁，会导致两个
+        // 几乎同时启动的实例都通过锁检查、随后都去 bind 51010 -> BindException
+        if (!acquireInstanceLock()) {
+            log("检测到另一个实例已在运行（端口 " + udpPort + " 已被占用），本实例退出以避免冲突。");
+            showNotification("LodopUdpBridge", "已在运行，无需重复启动");
+            System.exit(0);
+        }
+
         log("=================================================");
         log("  LodopUdpBridge —— 局域网打印网关（纯后台版）");
         log("  UDP 端口: " + udpPort);
@@ -910,13 +919,6 @@ public class LodopUdpBridge {
             log("⚠ 系统不支持托盘图标");
         }
 
-        // 单实例校验：若已有同类实例占用端口，则静默退出，避免重复绑定冲突
-        if (!acquireInstanceLock()) {
-            log("检测到另一个实例已在运行（端口 " + udpPort + " 已被占用），本实例退出以避免冲突。");
-            showNotification("LodopUdpBridge", "已在运行，无需重复启动");
-            System.exit(0);
-        }
-
         // 启动 UDP 监听（主线程）
         startUdpServer(udpPort);
     }
@@ -927,10 +929,12 @@ public class LodopUdpBridge {
         log("正在启动 UDP 监听（端口 " + port + "）...");
         DatagramSocket socket = null;
         try {
-            // 先创建未绑定 socket，开启 SO_REUSEADDR 再绑定，
-            // 避免上一次退出后端口处于 TIME_WAIT 导致的 "Address already in use"
+            // 独占绑定：不加 SO_REUSEADDR。
+            // 原因：UDP + SO_REUSEADDR 在 Windows 上允许第二个 socket 也 bind 同一端口，
+            // 会导致单实例锁被绕过时出现"静默双绑"（两个进程都收包、行为错乱）。
+            // 重复启动已由 main 最前端的 acquireInstanceLock() 拦截；若仍 bind 失败，
+            // 说明 51010 被外部程序占用，直接退出并提示，比静默双绑更安全。
             socket = new DatagramSocket(null);
-            socket.setReuseAddress(true);
             socket.bind(new InetSocketAddress(port));
             socket.setSoTimeout(0);
             final DatagramSocket bound = socket;

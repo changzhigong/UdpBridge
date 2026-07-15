@@ -45,7 +45,7 @@ import org.apache.pdfbox.rendering.ImageType;
 
 public class UniversalPrintBridge {
     static final int UDP_PORT = 52010;
-    static final String VERSION = "1.7.1";        // 网关版本(回传安卓显示)
+    static final String VERSION = "1.8.1";        // 网关版本(回传安卓显示)
     static final int MAX_PACKET = 65507;
     static final int CHUNK_SIZE = 8000;          // 安卓→PC 上传分片
     static final int PREVIEW_CHUNK_SIZE = 6000;  // PC→安卓 预览回传分片(旧版UDP兼容)
