@@ -1,6 +1,9 @@
 import java.net.*;
 import java.io.*;
 import java.nio.charset.StandardCharsets;
+import java.nio.channels.*;
+import java.nio.file.*;
+import java.nio.ByteBuffer;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
@@ -45,7 +48,12 @@ import javax.print.*;
  */
 public class LodopUdpBridge {
 
-    static final int UDP_PORT = 51010;
+    static final int UDP_PORT = 51010;  // 默认端口（兼容旧客户端）
+    // Windows(Hyper-V / WSL2 / WinNAT / Docker) 会在临时端口区保留一段端口，
+    // 导致 51010 等端口无法绑定（报 "Address already in use" 但 netstat 无记录）。
+    // 因此按序尝试候选端口，首个可绑定的即用；兼顾兼容性与可用性。
+    static final int[] UDP_PORT_CANDIDATES = {51010, 45678, 45679, 45680};
+    static int actualUdpPort = UDP_PORT;  // 实际绑定的端口（供托盘/日志展示）
     static final String CLODOP_WS_URL = "ws://127.0.0.1:8000/c_webskt/";
 
     // CLodop 协议分隔符 — 与 CLodopfuncs.js 第 9 行 DelimChar 一致
@@ -122,11 +130,13 @@ public class LodopUdpBridge {
 
     // 托盘图标
     static TrayIcon trayIcon;
+    static MenuItem statusMenuItem;  // 托盘"状态"菜单项（用于刷新真实端口）
     static List<String> printerList = new ArrayList<>();
     static boolean clodopConnected = false;
 
-    // 单实例锁文件（防止重复启动导致端口 51010 被占用）
-    static File instanceLockFile;
+    // 单实例锁（防止重复启动导致多实例争抢端口）
+    static FileChannel instanceLockChannel;
+    static FileLock instanceLock;
 
     // ============ Task ID 生成（修正 #1）============
 
@@ -639,13 +649,14 @@ public class LodopUdpBridge {
         try {
             SystemTray tray = SystemTray.getSystemTray();
             Image icon = createTrayIcon();
-            trayIcon = new TrayIcon(icon, "CLODOP 桥 51010");
+            trayIcon = new TrayIcon(icon, "CLODOP 桥 " + actualUdpPort);
             trayIcon.setImageAutoSize(true);
 
             PopupMenu popup = new PopupMenu();
 
             // 状态
-            MenuItem statusItem = new MenuItem("状态: 运行中（端口 " + UDP_PORT + "）");
+            MenuItem statusItem = new MenuItem("状态: 运行中（端口 " + actualUdpPort + "）");
+            statusMenuItem = statusItem;
             statusItem.setEnabled(false);
             popup.add(statusItem);
             popup.addSeparator();
@@ -749,6 +760,17 @@ public class LodopUdpBridge {
         }
     }
 
+    // 绑定成功后刷新托盘显示的真实端口
+    static void updateTrayPort() {
+        if (trayIcon != null) {
+            trayIcon.setToolTip("LodopUdpBridge (端口 " + actualUdpPort + ") —— " +
+                (clodopConnected ? "CLodop 已连接" : "CLodop 未连接"));
+        }
+        if (statusMenuItem != null) {
+            statusMenuItem.setLabel("状态: 运行中（端口 " + actualUdpPort + "）");
+        }
+    }
+
     static void showNotification(String title, String message) {
         if (trayIcon != null) {
             trayIcon.displayMessage(title, message, TrayIcon.MessageType.INFO);
@@ -822,26 +844,33 @@ public class LodopUdpBridge {
             if (appData == null) appData = ".";
             File dir = new File(appData, "LodopUdpBridge");
             if (!dir.exists()) dir.mkdirs();
-            instanceLockFile = new File(dir, "lodop.lock");
-
-            if (instanceLockFile.exists()) {
-                String pidStr = readFirstLine(instanceLockFile);
-                if (pidStr != null && isProcessAlive(pidStr)) {
-                    return false; // 另一个实例正在运行
-                }
-                // 锁文件残留（进程已死），删除后重新获取
-                instanceLockFile.delete();
+            File lockFile = new File(dir, "lodop.lock");
+            // OS 级原子锁：tryLock 是跨进程原子操作，互斥且无 TOCTOU 竞态；
+            // 锁随进程退出（含崩溃/kill -9）由 OS 自动释放，不会残留死锁。
+            instanceLockChannel = FileChannel.open(lockFile.toPath(),
+                    StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+            try {
+                instanceLock = instanceLockChannel.tryLock();
+            } catch (OverlappingFileLockException ofle) {
+                instanceLock = null; // 本 JVM 已持有（不会发生，main 仅调用一次）
             }
-
-            try (FileWriter w = new FileWriter(instanceLockFile)) {
-                w.write(String.valueOf(ProcessHandle.current().pid()));
+            if (instanceLock == null) {
+                try { instanceLockChannel.close(); } catch (Exception ignored) {}
+                return false; // 端口 51010 已被另一个实例占用
             }
+            // 写入 PID 便于排查（可选，不影响锁语义）
+            try {
+                instanceLockChannel.write(ByteBuffer.wrap(
+                        String.valueOf(ProcessHandle.current().pid()).getBytes()));
+                instanceLockChannel.force(true);
+            } catch (Exception ignored) {}
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-                try { if (instanceLockFile != null && instanceLockFile.exists()) instanceLockFile.delete(); } catch (Exception ignored) {}
+                try { if (instanceLock != null) instanceLock.release(); } catch (Exception ignored) {}
+                try { if (instanceLockChannel != null) instanceLockChannel.close(); } catch (Exception ignored) {}
             }));
             return true;
         } catch (Exception e) {
-            return true; // 锁文件机制为可选保护，失败时仍允许启动
+            return true; // 锁机制为可选保护，失败时仍允许启动
         }
     }
 
@@ -866,29 +895,28 @@ public class LodopUdpBridge {
     // ============ 主入口 ============
 
     public static void main(String[] args) {
-        int udpPort = UDP_PORT;
-
+        int[] candidates;
+        int overridePort = -1;
         for (int i = 0; i < args.length; i++) {
             if ("--udp".equals(args[i]) && i + 1 < args.length) {
-                udpPort = Integer.parseInt(args[i + 1]);
+                overridePort = Integer.parseInt(args[i + 1]);
             }
         }
+        candidates = (overridePort > 0) ? new int[]{overridePort} : UDP_PORT_CANDIDATES;
 
         // 初始化日志文件（必须最先调用）
         initLog();
 
         // 单实例校验（必须最先执行，在任何耗时操作之前）
-        // 防止启动竞态：先连接 CLodop / 初始化托盘 再校验锁，会导致两个
-        // 几乎同时启动的实例都通过锁检查、随后都去 bind 51010 -> BindException
         if (!acquireInstanceLock()) {
-            log("检测到另一个实例已在运行（端口 " + udpPort + " 已被占用），本实例退出以避免冲突。");
+            log("检测到另一个实例已在运行，本实例退出以避免冲突。");
             showNotification("LodopUdpBridge", "已在运行，无需重复启动");
             System.exit(0);
         }
 
         log("=================================================");
         log("  LodopUdpBridge —— 局域网打印网关（纯后台版）");
-        log("  UDP 端口: " + udpPort);
+        log("  UDP 候选端口: " + java.util.Arrays.toString(candidates));
         log("  C-Lodop: " + CLODOP_WS_URL);
         log("  无浏览器桥页面，纯后台运行 + 系统托盘");
         log("  日志文件: " + (logFile != null ? logFile.getAbsolutePath() : "未初始化"));
@@ -920,26 +948,30 @@ public class LodopUdpBridge {
         }
 
         // 启动 UDP 监听（主线程）
-        startUdpServer(udpPort);
+        startUdpServer(candidates);
     }
 
     // ============ UDP 服务器 ============
 
-    static void startUdpServer(int port) {
-        log("正在启动 UDP 监听（端口 " + port + "）...");
+    static void startUdpServer(int[] ports) {
+        for (int port : ports) {
+        log("正在尝试启动 UDP 监听（端口 " + port + "）...");
         DatagramSocket socket = null;
         try {
-            // 独占绑定：不加 SO_REUSEADDR。
-            // 原因：UDP + SO_REUSEADDR 在 Windows 上允许第二个 socket 也 bind 同一端口，
-            // 会导致单实例锁被绕过时出现"静默双绑"（两个进程都收包、行为错乱）。
-            // 重复启动已由 main 最前端的 acquireInstanceLock() 拦截；若仍 bind 失败，
-            // 说明 51010 被外部程序占用，直接退出并提示，比静默双绑更安全。
+            // 恢复 SO_REUSEADDR：允许复用处于释放期/残留的本地端口，
+            // 避免"端口刚被本进程前次退出残留 socket 短暂占用"导致的假冲突。
+            // 说明：Windows 上 Java 不提供 SO_REUSEPORT，SO_REUSEADDR 仅做端口复用，
+            // 不会造成"静默双绑"（那需 SO_REUSEPORT 且 Windows Java 不支持）；
+            // 两个真正并发的活实例仍由 main 最前端的 acquireInstanceLock() 原子锁拦截。
             socket = new DatagramSocket(null);
-            socket.bind(new InetSocketAddress(port));
+            socket.setReuseAddress(true);
+            socket.bind(new InetSocketAddress("0.0.0.0", port));  // 明确 IPv4，规避 Windows 双栈 :: 绑定歧义
             socket.setSoTimeout(0);
+            actualUdpPort = port;
             final DatagramSocket bound = socket;
-            log("✓ UDP 监听已启动，等待 App 发送 DISCOVER/PRINT 消息...");
+            log("✓ UDP 监听已启动（端口 " + port + "），等待 App 发送 DISCOVER/PRINT 消息...");
             log("");
+            updateTrayPort();  // 刷新托盘显示真实端口
 
             byte[] buf = new byte[65535];
             while (true) {
@@ -957,16 +989,17 @@ public class LodopUdpBridge {
                 new Thread(() -> handleUdpMessage(bound, packet, message), "UdpHandler").start();
             }
         } catch (SocketException e) {
-            logErr("UDP Socket 错误: " + e.getMessage());
-            logErr("请检查端口 " + port + " 是否被占用。");
-            showNotification("LodopUdpBridge 错误", "UDP 端口 " + port + " 被占用");
-            System.exit(1);
+            logErr("端口 " + port + " 绑定失败: " + e.getMessage() + "，尝试下一候选端口...");
+            // 继续尝试下一个候选端口
         } catch (IOException e) {
-            logErr("IO 错误: " + e.getMessage());
-        } finally {
-            if (socket != null) {
-                try { socket.close(); } catch (Exception ignored) {}
-            }
+            logErr("UDP IO 错误（端口 " + port + "）: " + e.getMessage());
+            return;
         }
+        }
+        // 所有候选端口均失败
+        logErr("所有候选端口均无法绑定，程序退出。");
+        logErr("候选端口: " + java.util.Arrays.toString(ports));
+        showNotification("LodopUdpBridge 错误", "UDP 端口全部被占用/保留");
+        System.exit(1);
     }
 }

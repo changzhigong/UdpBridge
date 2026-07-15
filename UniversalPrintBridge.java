@@ -45,11 +45,15 @@ import org.apache.pdfbox.rendering.ImageType;
 
 public class UniversalPrintBridge {
     static final int UDP_PORT = 52010;
-    static final String VERSION = "1.8.1";        // 网关版本(回传安卓显示)
+    static final String VERSION = "1.8.2";        // 网关版本(回传安卓显示)
     static final int MAX_PACKET = 65507;
     static final int CHUNK_SIZE = 8000;          // 安卓→PC 上传分片
     static final int PREVIEW_CHUNK_SIZE = 6000;  // PC→安卓 预览回传分片(旧版UDP兼容)
     static final int TCP_PORT = 52011;           // 数据面: 打印文件上传 + 预览回传(TCP 可靠传输)
+    // Windows(Hyper-V/WSL2/WinNAT/Docker) 会保留临时端口区，导致 52010/52011 等无法绑定。
+    // 按序尝试候选端口，首个可绑定即用；主端口保持 52010/52011 以兼容现有客户端。
+    static int actualUdpPort = UDP_PORT;
+    static int actualTcpPort = TCP_PORT;
     static final int TCP_TIMEOUT = 30000;        // TCP 每连接读写超时(ms)
     static final int MAX_RETRY = 3;
     static final String LOG_DIR = System.getenv("APPDATA") + "\\LodopUdpBridge";
@@ -728,21 +732,31 @@ public class UniversalPrintBridge {
     }
 
     static void startTcpServer() {
-        try {
-            ServerSocket server = new ServerSocket(TCP_PORT);
-            log("TCP 数据服务监听端口 " + TCP_PORT);
-            Thread t = new Thread(() -> {
-                while (!server.isClosed()) {
-                    try {
-                        Socket s = server.accept();
-                        new Thread(() -> handleTcpClient(s), "TcpClient").start();
-                    } catch (Exception e) { /* accept 异常, 继续监听 */ }
-                }
-            }, "TcpServer");
-            t.setDaemon(true); t.start();
-        } catch (Exception e) {
-            logErr("TCP 服务启动失败(端口 " + TCP_PORT + " 可能被占用或权限不足): " + e.getMessage());
+        ServerSocket server = null;
+        for (int p : new int[]{TCP_PORT, 52012, 52013}) {
+            try {
+                server = new ServerSocket(p);
+                actualTcpPort = p;
+                break;
+            } catch (Exception e) {
+                logErr("TCP 端口 " + p + " 绑定失败: " + e.getMessage() + "，尝试回退端口...");
+            }
         }
+        if (server == null) {
+            logErr("TCP 服务启动失败: 所有候选端口均无法绑定，数据面(预览/上传)将不可用。");
+            return;
+        }
+        final ServerSocket srv = server;
+        log("TCP 数据服务监听端口 " + actualTcpPort);
+        Thread t = new Thread(() -> {
+            while (!srv.isClosed()) {
+                try {
+                    Socket s = srv.accept();
+                    new Thread(() -> handleTcpClient(s), "TcpClient").start();
+                } catch (Exception e) { /* accept 异常, 继续监听 */ }
+            }
+        }, "TcpServer");
+        t.setDaemon(true); t.start();
     }
 
     static void handleTcpClient(Socket s) {
@@ -1190,17 +1204,23 @@ public class UniversalPrintBridge {
             // 【Win11 修复】强制绑定 IPv4 通配地址 0.0.0.0，而非依赖系统双栈(可能绑成 :: 而收不到 IPv4 受限广播 255.255.255.255)
             // Win11 默认开启 IPv6，new DatagramSocket(port) 会建 :: 双栈 socket；Windows 不会把 IPv4 受限广播投递给 :: 双栈 socket，
             // 导致安卓的 DISCOVER 广播永远进不来 -> 安卓扫描 poll timed out。绑定 0.0.0.0 可稳定接收 IPv4 广播与定向广播。
-            DatagramSocket socket;
-            try {
-                socket = new DatagramSocket(new InetSocketAddress("0.0.0.0", UDP_PORT));
-            } catch (SocketException e) {
-                // 绑定失败(如端口被占用/被安全软件拦截): 给出明确提示, 避免静默死亡
-                logErr("FATAL: UDP 端口 " + UDP_PORT + " 绑定失败 -> " + e.getMessage());
-                logErr("提示: 1)确认无其他程序占用 52010; 2)若报权限/访问被拒, 检查杀软或 Defender 网络保护是否拦截监听; 3)可用 `netstat -an -p UDP | find \"52010\"` 排查");
-                throw e;
+            DatagramSocket socket = null;
+            for (int p : new int[]{UDP_PORT, 52011, 52012}) {
+                try {
+                    socket = new DatagramSocket(new InetSocketAddress("0.0.0.0", p));
+                    actualUdpPort = p;
+                    break;
+                } catch (SocketException e) {
+                    // 绑定失败(如端口被 Windows 保留/被安全软件拦截): 尝试回退端口
+                    logErr("UDP 端口 " + p + " 绑定失败: " + e.getMessage() + "，尝试回退端口...");
+                }
+            }
+            if (socket == null) {
+                logErr("FATAL: 所有 UDP 候选端口均无法绑定，程序退出。");
+                System.exit(1);
             }
             socket.setBroadcast(true); // 确保可收发广播(回包为单播, 但开启广播选项更稳妥)
-            log("UDP 监听端口 " + UDP_PORT + " (已绑定 0.0.0.0 强制 IPv4, 兼容 Win11 广播发现)");
+            log("UDP 监听端口 " + actualUdpPort + " (已绑定 0.0.0.0 强制 IPv4, 兼容 Win11 广播发现)");
             byte[] buf = new byte[MAX_PACKET];
 
             while (true) {
@@ -1226,7 +1246,7 @@ public class UniversalPrintBridge {
                     String ip = getLocalIP();
                     String printers = listPrinters();
                     String resp = "{\"cmd\":\"DISCOVER_ACK\",\"hostname\":\"" + escapeJson(hostname)
-                        + "\",\"ip\":\"" + ip + "\",\"port\":" + UDP_PORT
+                        + "\",\"ip\":\"" + ip + "\",\"port\":" + actualUdpPort
                         + ",\"version\":\"" + VERSION + "\""
                         + ",\"printers\":" + printers + "}";
                     sendJson(socket, addr, rport, resp);
