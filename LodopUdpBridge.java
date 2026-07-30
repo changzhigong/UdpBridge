@@ -48,11 +48,11 @@ import javax.print.*;
  */
 public class LodopUdpBridge {
 
-    static final int UDP_PORT = 51010;  // 默认端口（兼容旧客户端）
+    static final int UDP_PORT = 45678;  // 主端口（默认监听端口）
     // Windows(Hyper-V / WSL2 / WinNAT / Docker) 会在临时端口区保留一段端口，
-    // 导致 51010 等端口无法绑定（报 "Address already in use" 但 netstat 无记录）。
+    // 导致 45678 等端口无法绑定（报 "Address already in use" 但 netstat 无记录）。
     // 因此按序尝试候选端口，首个可绑定的即用；兼顾兼容性与可用性。
-    static final int[] UDP_PORT_CANDIDATES = {51010, 45678, 45679, 45680};
+    static final int[] UDP_PORT_CANDIDATES = {45678, 45679, 45680};
     static int actualUdpPort = UDP_PORT;  // 实际绑定的端口（供托盘/日志展示）
     static final String CLODOP_WS_URL = "ws://127.0.0.1:8000/c_webskt/";
 
@@ -836,7 +836,7 @@ public class LodopUdpBridge {
     }
 
     // ============ 单实例锁 ============
-    // 防止重复启动导致 UDP 端口 51010 被占用（旧进程残留 / 多次点击启动）
+    // 防止重复启动导致 UDP 端口 45678 被占用（旧进程残留 / 多次点击启动）
 
     static boolean acquireInstanceLock() {
         try {
@@ -856,7 +856,7 @@ public class LodopUdpBridge {
             }
             if (instanceLock == null) {
                 try { instanceLockChannel.close(); } catch (Exception ignored) {}
-                return false; // 端口 51010 已被另一个实例占用
+                return false; // 端口 45678 已被另一个实例占用
             }
             // 写入 PID 便于排查（可选，不影响锁语义）
             try {
