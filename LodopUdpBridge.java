@@ -9,6 +9,8 @@ import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.regex.*;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import javax.swing.*;
 import java.awt.Color;
 import java.awt.Font;
@@ -55,6 +57,9 @@ public class LodopUdpBridge {
     static final int[] UDP_PORT_CANDIDATES = {45678, 45679, 45680};
     static int actualUdpPort = UDP_PORT;  // 实际绑定的端口（供托盘/日志展示）
     static final String CLODOP_WS_URL = "ws://127.0.0.1:8000/c_webskt/";
+    // 网关连接到本机 C-Lodop 的 WS 端口（DISCOVER_ACK 回传给安卓，用于直连打印）。
+    // 若 PC 端 C-Lodop 改过端口，这里需同步修改；安卓端失败时会回退尝试 18000。
+    static final int CLODOP_WS_PORT = 8000;
 
     // CLodop 协议分隔符 — 与 CLodopfuncs.js 第 9 行 DelimChar 一致
     static final String DELIM = "\f\f";
@@ -133,6 +138,15 @@ public class LodopUdpBridge {
     static MenuItem statusMenuItem;  // 托盘"状态"菜单项（用于刷新真实端口）
     static List<String> printerList = new ArrayList<>();
     static boolean clodopConnected = false;
+
+    // ---- 方案 A/B：线程池 + 去重（缓解 PC 繁忙时打印响应慢/卡顿） ----
+    // 分发线程池：接收循环把消息提交给它，避免接收线程被业务阻塞
+    static ExecutorService dispatchExecutor;
+    // 打印线程池：真正调 CLodop 的耗时动作放到后台，立即回"已受理"ACK
+    static ThreadPoolExecutor printExecutor;
+    // 去重表：PRINT 内容指纹 -> 受理时间戳；TTL 内重复包（UDP 重传/丢包重发）只回 ACK 不重复打印
+    static final ConcurrentHashMap<String, Long> printedFingerprints = new ConcurrentHashMap<>();
+    static final long DEDUP_TTL_MS = 5 * 60 * 1000; // 5 分钟
 
     // 单实例锁（防止重复启动导致多实例争抢端口）
     static FileChannel instanceLockChannel;
@@ -413,9 +427,8 @@ public class LodopUdpBridge {
 
     // ============ UDP 消息处理 ============
 
-    static void handleUdpMessage(DatagramSocket socket, DatagramPacket packet, String message) {
-        String senderIp = packet.getAddress().getHostAddress();
-        int senderPort = packet.getPort();
+    static void handleUdpMessage(DatagramSocket socket, InetAddress senderAddr, int senderPort, String message) {
+        String senderIp = senderAddr.getHostAddress();
 
         try {
             // 解析 JSON 消息（简单解析，避免依赖 JSON 库）
@@ -443,6 +456,7 @@ public class LodopUdpBridge {
                 StringBuilder sb = new StringBuilder();
                 sb.append("{\"cmd\":\"DISCOVER_ACK\",\"hostname\":\"").append(escapeJsonStr(hostname));
                 sb.append("\",\"ip\":\"").append(escapeJsonStr(localIp));
+                sb.append("\",\"wsPort\":\"").append(CLODOP_WS_PORT);
                 sb.append("\",\"printers\":");
                 sb.append("[");
                 for (int i = 0; i < printers.size(); i++) {
@@ -453,7 +467,7 @@ public class LodopUdpBridge {
 
                 byte[] respData = sb.toString().getBytes(StandardCharsets.UTF_8);
                 DatagramPacket respPacket = new DatagramPacket(respData, respData.length,
-                    packet.getAddress(), senderPort);
+                    senderAddr, senderPort);
                 socket.send(respPacket);
 
                 log("[DISCOVER] 响应 → " + senderIp + " (打印机: " + printers.size() + " 台)");
@@ -476,48 +490,60 @@ public class LodopUdpBridge {
                 if (pageName == null) pageName = "";
                 if (taskName == null || taskName.isEmpty()) taskName = "拣货单打印";
 
-                log("[PRINT] 收到打印任务: " + taskName + " | 打印机: " + printer + " | HTML长度: " + html.length() + " 字符");
-                // 调试：把 HTML 前 500 字符打到日志
-                if (html.length() > 0) {
-                    log("[PRINT] HTML前500字符: " + html.substring(0, Math.min(500, html.length())));
-                } else {
-                    logErr("[PRINT] HTML 为空！");
-                }
+                log("[PRINT] 收到打印任务: " + taskName + " | 打印机: " + printer + " | HTML长度: " + (html == null ? 0 : html.length()) + " 字符");
 
                 if (html == null || html.isEmpty()) {
-                    sendPrintAck(socket, packet.getAddress(), senderPort, false, "HTML 内容为空");
+                    sendPrintAck(socket, senderAddr, senderPort, false, "HTML 内容为空");
                     return;
                 }
 
-                // ⚠️ 不再在此处调用 listPrintersFromClodop()（新增 WS 连接耗时 5-10s，导致 App 超时）
-                // 打印机列表在启动时已加载，打印时直接使用
                 if (printerList.isEmpty()) {
                     log("[PRINT] 警告：启动时未获取到打印机列表，使用指定打印机: " + printer);
                 }
 
-                // 构建并发送 CLodop 协议消息
-                String taskId = generateTaskId();
-                String clodopMsg = buildClodopMessage(taskId, taskName, printer,
-                    orient, pageWidth, pageHeight, pageName, html);
+                // ===== 方案 A/B：异步受理 + 去重，缓解 PC 繁忙时的响应慢/卡顿 =====
+                // 1) 立即回"已受理"ACK，不等 CLodop（用户点击后几十毫秒即收到确认）
+                sendPrintAck(socket, senderAddr, senderPort, true, "RECEIVED");
+                log("[PRINT] 已回受理 ACK（后台异步打印中）→ " + senderIp + " (" + taskName + ")");
 
-                log("[PRINT] CLodop 协议消息已构建，taskId=" + taskId + "，消息总长度=" + clodopMsg.length() + " 字节");
-                // 打出消息头（到第一个 DELIM 后 80 字符为止），确认字段顺序
-                int hLen = Math.min(clodopMsg.length(), clodopMsg.indexOf(DELIM + "tid=") + 200);
-                if (hLen < 0) hLen = Math.min(clodopMsg.length(), 300);
-                log("[PRINT] 消息头: " + clodopMsg.substring(0, hLen).replace(DELIM, "|"));
-
-                boolean ok = sendToClodopAndWait(clodopMsg, 20000);
-
-                // 返回 PRINT_ACK（修正 #7）
-            if (ok) {
-                sendPrintAck(socket, packet.getAddress(), senderPort, true, taskId + "=true");
-                log("[PRINT] 成功 → " + senderIp + " (" + taskName + ")");
-                showNotification("打印成功", taskName + " - " + printer);
-            } else {
-                    sendPrintAck(socket, packet.getAddress(), senderPort, false, "CLodop 返回 false");
-                    log("[PRINT] 失败 → " + senderIp + " (" + taskName + ")");
-                    showNotification("打印失败", taskName + " - CLodop 返回 false");
+                // 2) 去重：相同内容指纹在 TTL 内只打印一次，防止 App 重传 / UDP 重复包导致重复出纸
+                final String fp = computeFingerprint(printer, taskName, html);
+                final long now = System.currentTimeMillis();
+                purgeExpiredFingerprints(now);
+                Long prev = printedFingerprints.putIfAbsent(fp, now);
+                if (prev != null && (now - prev) < DEDUP_TTL_MS) {
+                    log("[PRINT] 去重命中，跳过重复打印: " + taskName + " (fp=" + fp.substring(0, 12) + ")");
+                    return; // 已受理 ACK 已回，不重复打印
                 }
+
+                // 3) 真正打印提交到后台线程池，结果仅用托盘/日志通知（不再阻塞 ACK）
+                final String fPrinter = printer, fOrient = orient, fPageWidth = pageWidth,
+                             fPageHeight = pageHeight, fPageName = pageName, fTaskName = taskName, fHtml = html;
+                printExecutor.submit(() -> {
+                    try {
+                        String taskId = generateTaskId();
+                        String clodopMsg = buildClodopMessage(taskId, fTaskName, fPrinter,
+                            fOrient, fPageWidth, fPageHeight, fPageName, fHtml);
+                        log("[PRINT] CLodop 协议消息已构建，taskId=" + taskId + "，消息总长度=" + clodopMsg.length() + " 字节");
+                        int hLen = Math.min(clodopMsg.length(), clodopMsg.indexOf(DELIM + "tid=") + 200);
+                        if (hLen < 0) hLen = Math.min(clodopMsg.length(), 300);
+                        log("[PRINT] 消息头: " + clodopMsg.substring(0, hLen).replace(DELIM, "|"));
+
+                        boolean ok = sendToClodopAndWait(clodopMsg, 20000);
+                        if (ok) {
+                            log("[PRINT] 成功 → " + senderIp + " (" + fTaskName + ")");
+                            showNotification("打印成功", fTaskName + " - " + fPrinter);
+                        } else {
+                            printedFingerprints.remove(fp); // 失败则移除，允许 TTL 内重传重试
+                            log("[PRINT] 失败 → " + senderIp + " (" + fTaskName + ")");
+                            showNotification("打印失败", fTaskName + " - CLodop 返回 false");
+                        }
+                    } catch (Exception ex) {
+                        printedFingerprints.remove(fp);
+                        logErr("[PRINT] 异步打印异常: " + ex.getMessage());
+                        showNotification("打印异常", fTaskName + " - " + ex.getMessage());
+                    }
+                });
 
             } else {
                 log("[UDP] 未知命令: " + cmd + " (来自 " + senderIp + ")");
@@ -526,7 +552,7 @@ public class LodopUdpBridge {
         } catch (Exception e) {
             logErr("处理 UDP 消息失败: " + e.getMessage());
             try {
-                sendPrintAck(socket, packet.getAddress(), senderPort, false, "Bridge 内部错误: " + e.getMessage());
+                sendPrintAck(socket, senderAddr, senderPort, false, "Bridge 内部错误: " + e.getMessage());
             } catch (Exception ignored) {}
         }
     }
@@ -541,6 +567,34 @@ public class LodopUdpBridge {
             log("[PRINT] 已发送 PRINT_ACK: ok=" + ok + " detail=" + detail);
         } catch (Exception e) {
             logErr("发送 PRINT_ACK 失败: " + e.getMessage());
+        }
+    }
+
+    /** 计算 PRINT 内容指纹（SHA-256），用于 TTL 内去重，防止 UDP 重传/重复包导致重复出纸 */
+    static String computeFingerprint(String printer, String taskName, String html) {
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            md.update((printer == null ? "" : printer).getBytes(StandardCharsets.UTF_8));
+            md.update((byte) 0x1F);
+            md.update((taskName == null ? "" : taskName).getBytes(StandardCharsets.UTF_8));
+            md.update((byte) 0x1F);
+            md.update((html == null ? "" : html).getBytes(StandardCharsets.UTF_8));
+            byte[] d = md.digest();
+            StringBuilder sb = new StringBuilder();
+            for (byte b : d) sb.append(String.format("%02x", b));
+            return sb.toString();
+        } catch (NoSuchAlgorithmException e) {
+            // 极端兜底：用字符串哈希
+            return "fb_" + Integer.toHexString((printer + taskName + html).hashCode());
+        }
+    }
+
+    /** 清理过期的去重指纹，避免内存无限增长 */
+    static void purgeExpiredFingerprints(long now) {
+        for (java.util.Map.Entry<String, Long> e : printedFingerprints.entrySet()) {
+            if (now - e.getValue() > DEDUP_TTL_MS) {
+                printedFingerprints.remove(e.getKey());
+            }
         }
     }
 
@@ -947,6 +1001,18 @@ public class LodopUdpBridge {
             log("⚠ 系统不支持托盘图标");
         }
 
+        // 初始化线程池（方案 A/B：分发 + 异步打印）
+        dispatchExecutor = Executors.newCachedThreadPool();
+        printExecutor = new ThreadPoolExecutor(
+            2, 8, 60, TimeUnit.SECONDS,
+            new LinkedBlockingQueue<>(64));
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            try { if (dispatchExecutor != null) dispatchExecutor.shutdownNow(); } catch (Exception ignored) {}
+            try { if (printExecutor != null) printExecutor.shutdownNow(); } catch (Exception ignored) {}
+        }));
+        log("线程池已初始化：dispatch=" + dispatchExecutor + "，print=" + printExecutor.getCorePoolSize()
+            + "~" + printExecutor.getMaximumPoolSize());
+
         // 启动 UDP 监听（主线程）
         startUdpServer(candidates);
     }
@@ -973,20 +1039,28 @@ public class LodopUdpBridge {
             log("");
             updateTrayPort();  // 刷新托盘显示真实端口
 
+            // 增大 UDP 接收缓冲区，减少 PC 繁忙时缓冲区溢出丢包（丢包会导致 App 等 ACK 超时）
+            try { bound.setReceiveBufferSize(1024 * 1024); } catch (Exception ignored) {}
+            log("[UDP] 接收缓冲区已设为 1MB");
+
             byte[] buf = new byte[65535];
             while (true) {
                 DatagramPacket packet = new DatagramPacket(buf, buf.length);
                 bound.receive(packet);
 
-                String message = new String(
+                // 复制地址/端口（packet 对象会被下一次 receive 复用，不能在线程里再用原对象）
+                final InetAddress senderAddr = packet.getAddress();
+                final int senderPort = packet.getPort();
+                final String message = new String(
                     packet.getData(), 0, packet.getLength(), StandardCharsets.UTF_8);
 
-                String senderIp = packet.getAddress().getHostAddress();
+                String senderIp = senderAddr.getHostAddress();
                 log("[UDP] 收到来自 " + senderIp +
                     " 的消息（" + message.length() + " 字节） | cmd=" + extractJsonField(message, "cmd"));
 
-                // 在新线程处理，避免阻塞接收
-                new Thread(() -> handleUdpMessage(bound, packet, message), "UdpHandler").start();
+                // 提交到分发线程池处理，接收循环不被业务阻塞
+                final DatagramSocket s = bound;
+                dispatchExecutor.submit(() -> handleUdpMessage(s, senderAddr, senderPort, message));
             }
         } catch (SocketException e) {
             logErr("端口 " + port + " 绑定失败: " + e.getMessage() + "，尝试下一候选端口...");
