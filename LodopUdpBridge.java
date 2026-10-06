@@ -350,11 +350,13 @@ public class LodopUdpBridge {
                             log("[CLODOP-WS] 打印机列表已更新，共 " + printerList.size() + " 台");
                         }
 
-                        // 修正 #7：解析 CLodop 响应 TaskID=ResultValue
-                        if (fullMsg.contains("=") && !fullMsg.contains("strWebPageID") && !fullMsg.contains("Printers")) {
-                            int pos = fullMsg.indexOf("=");
-                            if (pos > 0 && pos < 50) {
-                                resultValue[0] = fullMsg.substring(pos + 1).trim().toLowerCase();
+                        // 修正 #7：解析 CLodop 响应 ResultValue（真实返回形如 TaskID=<tid>ResultValue=true|false）
+                        // ⚠️ 必须以 ResultValue= 为锚点提取布尔值，不能用第一个 '='（否则 TaskID= 截到 tid，永远不等于 true）
+                        int rvIdx = fullMsg.toLowerCase().indexOf("resultvalue=");
+                        if (rvIdx >= 0 && !fullMsg.contains("strWebPageID") && !fullMsg.contains("Printers")) {
+                            String v = fullMsg.substring(rvIdx + "resultvalue=".length()).trim().toLowerCase();
+                            if (v.startsWith("true") || v.startsWith("false")) {
+                                resultValue[0] = v.startsWith("true") ? "true" : "false";
                                 log("[CLODOP-WS] 解析到响应: " + fullMsg.trim());
                                 resultLatch.countDown();
                             }
