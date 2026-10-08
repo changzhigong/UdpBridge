@@ -146,7 +146,17 @@ public class LodopUdpBridge {
     static ThreadPoolExecutor printExecutor;
     // 去重表：PRINT 内容指纹 -> 受理时间戳；TTL 内重复包（UDP 重传/丢包重发）只回 ACK 不重复打印
     static final ConcurrentHashMap<String, Long> printedFingerprints = new ConcurrentHashMap<>();
-    static final long DEDUP_TTL_MS = 5 * 60 * 1000; // 5 分钟
+    // 去重窗口：30 秒（2026-10-07 由 5 分钟 → 60 秒 → 30 秒）。
+    // 去重只用于挡住「同一次点击的应用层重传 / UDP 丢包重发」这类瞬时重复：
+    //   App 侧 sendPrintViaUdp 的 maxRetries=3、单次等 ACK 3000ms、退避 800ms
+    //   ⇒ 同一次点击的 3 个包最坏跨度 ≈ 3×3000 + 2×800 = 10.6 秒；
+    //   ACK 正常几十毫秒返回时，跨度仅约 1.6 秒。
+    // 故 30 秒已有 3 倍余量，同时最大限度不误伤正常重打印。
+    // 原 5 分钟过长：用户打完单据后 2–3 分钟内重打印同一张（HTML 逐字节相同）
+    // 会被当成重复包跳过 → 不出纸，而 App 因「受理 ACK 在去重判断之前」已提示成功，
+    // 形成假成功（2026-10-07 实测：16:16 成功、16:19/16:19:36 两次去重跳过）。
+    // 注：去重是逐字节 SHA-256 比对，不同单据内容不同不会撞，只有「同一张单据重复打印」才会命中。
+    static final long DEDUP_TTL_MS = 30 * 1000; // 30 秒
 
     // 单实例锁（防止重复启动导致多实例争抢端口）
     static FileChannel instanceLockChannel;
@@ -350,11 +360,14 @@ public class LodopUdpBridge {
                             log("[CLODOP-WS] 打印机列表已更新，共 " + printerList.size() + " 台");
                         }
 
-                        // 修正 #7：解析 CLodop 响应 ResultValue（真实返回形如 TaskID=<tid>ResultValue=true|false）
-                        // ⚠️ 必须以 ResultValue= 为锚点提取布尔值，不能用第一个 '='（否则 TaskID= 截到 tid，永远不等于 true）
-                        int rvIdx = fullMsg.toLowerCase().indexOf("resultvalue=");
-                        if (rvIdx >= 0 && !fullMsg.contains("strWebPageID") && !fullMsg.contains("Printers")) {
-                            String v = fullMsg.substring(rvIdx + "resultvalue=".length()).trim().toLowerCase();
+                        // 🔴 实测回帧格式（bridge.log 144/144 全部命中，无一例外）：
+                        //    "JAVA151626_3=true" —— 即 <TaskID>=<true|false>，【没有 ResultValue= 字段】。
+                        //    曾误按 "ResultValue=" 锚点解析 → 永远匹配不到（网关日志「解析到响应」计数为 0，
+                        //    一直被"先回受理 ACK"掩盖，真实打印结果其实从未确认过）。
+                        // 正确取法：取最后一个 '=' 之后的部分判布尔，同时兼容 "TaskID=xResultValue=true"。
+                        int eq = fullMsg.lastIndexOf('=');
+                        if (eq >= 0 && !fullMsg.contains("strWebPageID") && !fullMsg.contains("Printers")) {
+                            String v = fullMsg.substring(eq + 1).trim().toLowerCase();
                             if (v.startsWith("true") || v.startsWith("false")) {
                                 resultValue[0] = v.startsWith("true") ? "true" : "false";
                                 log("[CLODOP-WS] 解析到响应: " + fullMsg.trim());
