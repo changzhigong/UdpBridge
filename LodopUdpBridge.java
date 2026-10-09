@@ -60,6 +60,10 @@ public class LodopUdpBridge {
     // 网关连接到本机 C-Lodop 的 WS 端口（DISCOVER_ACK 回传给安卓，用于直连打印）。
     // 若 PC 端 C-Lodop 改过端口，这里需同步修改；安卓端失败时会回退尝试 18000。
     static final int CLODOP_WS_PORT = 8000;
+    // 备选 WS 端口（C-Lodop 角色2 默认还会在 18000 监听）；就绪探测时一并检查。
+    static final int CLODOP_WS_PORT_FALLBACK = 18000;
+    // 开机自启时等待 C-Lodop 就绪的上限（毫秒）。打印服务晚于托盘进程启动，需留足时间。
+    static final int CLODOP_READY_WAIT_MS = 90 * 1000;
 
     // CLodop 协议分隔符 — 与 CLodopfuncs.js 第 9 行 DelimChar 一致
     static final String DELIM = "\f\f";
@@ -250,6 +254,60 @@ public class LodopUdpBridge {
             return listPrintersFallback();
         }
         return printers;
+    }
+
+    /**
+     * 探测 C-Lodop 的 WS 端口是否已就绪（纯 TCP connect，不发 WS 握手）。
+     *
+     * 🔴 为什么需要（2026-10-09 开机时序问题）：
+     *   C-Lodop 有两个进程——CLodopPrint64.exe（真正监听 8000/18000 的打印服务）
+     *   与 CLodopPrint64_backup.exe（托盘图标）。托盘出现【不代表】打印服务已就绪，
+     *   开机后打印服务还要初始化打印机驱动并切到网络模式角色2，存在数十秒空窗期。
+     *   此前网关在此空窗期启动会「假装运行」：连不上 C-Lodop 就降级用系统打印机列表，
+     *   然后照常开放 UDP 端口 ⇒ App 立刻发 PRINT 必然失败：
+     *     · 直连 → SocketTimeoutException: failed to connect ... after 5000ms（走网卡被 DROP）
+     *     · 网关 → java.net.ConnectException（连 127.0.0.1:8000 被立即拒绝）
+     *   故启动时必须先等 C-Lodop 真正就绪，再开放 UDP。
+     *
+     * @return true=端口可连（就绪）
+     */
+    static boolean isClodopPortReady(int port, int timeoutMs) {
+        try (java.net.Socket s = new java.net.Socket()) {
+            s.connect(new InetSocketAddress("127.0.0.1", port), timeoutMs);
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
+     * 等待 C-Lodop 就绪：轮询候选端口（CLODOP_WS_PORT 与备选 18000）。
+     *
+     * @param maxWaitMs 总等待上限（毫秒），超过则放弃（仍继续启动，降级运行）
+     * @return true=在上限内等到就绪
+     */
+    static boolean waitClodopReady(int maxWaitMs) {
+        int[] ports = new int[]{ CLODOP_WS_PORT, CLODOP_WS_PORT_FALLBACK };
+        long deadline = System.currentTimeMillis() + maxWaitMs;
+        int logged = 0;
+        while (System.currentTimeMillis() < deadline) {
+            for (int port : ports) {
+                if (isClodopPortReady(port, 800)) {
+                    if (logged > 0) {
+                        log("✓ C-Lodop 已就绪（端口 " + port + "，等待约 " + logged + " 秒）");
+                    }
+                    return true;
+                }
+            }
+            if (logged == 0) {
+                log("等待 C-Lodop 就绪（端口 " + CLODOP_WS_PORT + "/" + CLODOP_WS_PORT_FALLBACK
+                    + "）… 开机自启时打印服务可能晚于托盘几十秒");
+            }
+            logged++;
+            try { Thread.sleep(2000); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); return false; }
+        }
+        log("⚠ 等待 C-Lodop 就绪超时（" + (maxWaitMs / 1000) + " 秒），仍以降级方式启动");
+        return false;
     }
 
     /** 从 CLodop WS 获取初始化消息（含 Printers 对象） */
@@ -990,6 +1048,12 @@ public class LodopUdpBridge {
         log("  无浏览器桥页面，纯后台运行 + 系统托盘");
         log("  日志文件: " + (logFile != null ? logFile.getAbsolutePath() : "未初始化"));
         log("=================================================");
+
+        // 🔴 开机时序（2026-10-09）：托盘进程（CLodopPrint64_backup.exe）先起、打印服务
+        //   （CLodopPrint64.exe，真正监听 8000/18000）后初始化，此间存在数十秒空窗期。
+        //   必须先等 C-Lodop 真正就绪，再开放 UDP 端口，否则 App 立刻发 PRINT 必然失败
+        //   （直连 SocketTimeout / 网关 ConnectException）。超时则降级启动，不阻塞开机。
+        waitClodopReady(CLODOP_READY_WAIT_MS);
 
         // 启动时先获取打印机列表
         log("正在连接 CLodop 获取打印机列表...");
